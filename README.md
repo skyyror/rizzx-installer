@@ -8,20 +8,20 @@ Bisa dipakai manual tanpa bot Telegram, dan tetap kompatibel dengan bot RIZZX V8
 Jalankan sebagai **root** di VPS bersih:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/USERNAME/rizzx-installer/main/install-panel.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/skyyror/rizzx-installer/main/install-panel.sh)
 ```
 
 Perintah di atas membuka **menu interaktif**. Mau langsung ke perintah tertentu:
 
 ```bash
 # Panel saja
-bash <(curl -fsSL https://raw.githubusercontent.com/USERNAME/rizzx-installer/main/install-panel.sh) panel --fqdn panel.domain.com --ssl --yes
+bash <(curl -fsSL https://raw.githubusercontent.com/skyyror/rizzx-installer/main/install-panel.sh) panel --fqdn panel.domain.com --ssl --yes
 
 # Panel + Wings + Node otomatis (satu VPS)
-bash <(curl -fsSL https://raw.githubusercontent.com/USERNAME/rizzx-installer/main/install-panel.sh) full --fqdn panel.domain.com --ssl --yes
+bash <(curl -fsSL https://raw.githubusercontent.com/skyyror/rizzx-installer/main/install-panel.sh) full --fqdn panel.domain.com --ssl --yes
 
 # Wings saja (VPS node terpisah)
-bash <(curl -fsSL https://raw.githubusercontent.com/USERNAME/rizzx-installer/main/install-panel.sh) wings --panel-url https://panel.domain.com --node-id 1 --token ptla_xxx
+bash <(curl -fsSL https://raw.githubusercontent.com/skyyror/rizzx-installer/main/install-panel.sh) wings --panel-url https://panel.domain.com --node-id 1 --token ptla_xxx
 ```
 
 > Ganti `USERNAME` dengan username GitHub kamu dan `panel.domain.com` dengan domain Panel.
