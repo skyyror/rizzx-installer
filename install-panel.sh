@@ -39,6 +39,8 @@ PANEL_VERSION="${PANEL_VERSION:-latest}"
 MAKE_API_KEY="${MAKE_API_KEY:-false}"
 ASSUME_YES="${ASSUME_YES:-false}"
 FORCE_OS="${FORCE_OS:-false}"
+FORCE_SSL="${FORCE_SSL:-false}"      # true = jangan batalkan SSL walau DNS tampak tidak cocok
+REQUIRE_SSL="${REQUIRE_SSL:-false}"  # true = exit != 0 bila SSL gagal terbit (dipakai bot)
 NODE_FQDN="${NODE_FQDN:-}"
 NODE_NAME="${NODE_NAME:-Node-RIZZX}"
 NODE_RAM="${NODE_RAM:-}"
@@ -58,6 +60,7 @@ if [[ $IS_TTY == 1 ]]; then
 else
   RST=''; BLD=''; DIM=''; RED=''; GRN=''; YEL=''; CYN=''; MAG=''; GRY=''
 fi
+CLR=''; if [[ $IS_TTY == 1 ]]; then CLR=$'\r\e[2K'; fi
 SPIN=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 ERR_SHOWN=0; STEP_NUM=0; STEP_TOTAL=0; SSL_OK=0; CHILD_PID=""
 RAM_MB=0; DISK_MB=0; VIRT=""; OS_ID=""; OS_VER=""; OS_CODENAME=""; PUBLIC_IP=""
@@ -129,6 +132,8 @@ Opsi umum:
   --api-key             Buat Application API key (ptla_) untuk bot/API
   --yes, -y             Tanpa pertanyaan (non-interaktif)
   --force-os            Lewati cek OS (risiko ditanggung sendiri)
+  --force-ssl           Tetap coba SSL walau DNS tampak tidak cocok
+  --require-ssl         Exit dengan error bila SSL gagal terbit
 
 Opsi node (full / wings):
   --node-fqdn <domain>  FQDN node (default = FQDN Panel)
@@ -163,6 +168,8 @@ while [[ $# -gt 0 ]]; do
     --api-key)       MAKE_API_KEY="true"; shift ;;
     --yes|-y)        ASSUME_YES="true"; shift ;;
     --force-os)      FORCE_OS="true"; shift ;;
+    --force-ssl)     FORCE_SSL="true"; shift ;;
+    --require-ssl)   REQUIRE_SSL="true"; shift ;;
     --node-fqdn)     NODE_FQDN="${2:-}"; shift 2 ;;
     --node-name)     NODE_NAME="${2:-}"; shift 2 ;;
     --node-ram)      NODE_RAM="${2:-}"; shift 2 ;;
@@ -187,6 +194,8 @@ ENABLE_SSL="$(to_bool "$ENABLE_SSL")"
 MAKE_API_KEY="$(to_bool "$MAKE_API_KEY")"; if [[ $MAKE_API_KEY == ask ]]; then MAKE_API_KEY=false; fi
 ASSUME_YES="$(to_bool "$ASSUME_YES")";     if [[ $ASSUME_YES == ask ]]; then ASSUME_YES=false; fi
 FORCE_OS="$(to_bool "$FORCE_OS")";         if [[ $FORCE_OS == ask ]]; then FORCE_OS=false; fi
+FORCE_SSL="$(to_bool "$FORCE_SSL")";       if [[ $FORCE_SSL == ask ]]; then FORCE_SSL=false; fi
+REQUIRE_SSL="$(to_bool "$REQUIRE_SSL")";   if [[ $REQUIRE_SSL == ask ]]; then REQUIRE_SSL=false; fi
 
 # ── Input interaktif (baca dari /dev/tty → aman untuk `bash <(curl ...)`) ────
 if [[ $ASSUME_YES != true ]] && (exec </dev/tty) 2>/dev/null; then HAVE_TTY=1; fi
@@ -244,14 +253,14 @@ run_step() { # run_step [-s] "Label" fungsi [arg...]   (-s = soft: gagal tidak m
   CHILD_PID=""
   local took=$((SECONDS - start))
   if [[ $rc -eq 0 ]]; then
-    printf '\r\e[2K  %s✔%s %s[%s]%s %s %s(%ss) %s %s%%%s\n' "$GRN" "$RST" "$GRY" "$tag" "$RST" "$label" "$GRY" "$took" "$(bar "$pct")" "$pct" "$RST"
+    printf '%s  %s✔%s %s[%s]%s %s %s(%ss) %s %s%%%s\n' "$CLR" "$GRN" "$RST" "$GRY" "$tag" "$RST" "$label" "$GRY" "$took" "$(bar "$pct")" "$pct" "$RST"
     return 0
   fi
   if [[ $soft -eq 1 ]]; then
-    printf '\r\e[2K  %s⚠%s %s[%s]%s %s %s(dilewati, kode %s)%s\n' "$YEL" "$RST" "$GRY" "$tag" "$RST" "$label" "$GRY" "$rc" "$RST"
+    printf '%s  %s⚠%s %s[%s]%s %s %s(dilewati, kode %s)%s\n' "$CLR" "$YEL" "$RST" "$GRY" "$tag" "$RST" "$label" "$GRY" "$rc" "$RST"
     return "$rc"
   fi
-  printf '\r\e[2K  %s✘%s %s[%s]%s %s\n' "$RED" "$RST" "$GRY" "$tag" "$RST" "$label"
+  printf '%s  %s✘%s %s[%s]%s %s\n' "$CLR" "$RED" "$RST" "$GRY" "$tag" "$RST" "$label"
   echo; echo "  ${RED}${BLD}── 20 baris log terakhir ──${RST}"
   tail -n 20 "$LOG_FILE" | sed 's/^/    /'
   echo
@@ -406,7 +415,8 @@ gather_panel_config() {
   fi
   if [[ $ENABLE_SSL == true ]]; then
     if ! dns_matches "$FQDN"; then
-      if ! confirm "Tetap coba SSL?" n; then ENABLE_SSL=false; warn "SSL dilewati. Panel akan dipasang via HTTP."; fi
+      if [[ $FORCE_SSL == true ]]; then warn "Lanjut mencoba SSL karena --force-ssl."
+      elif ! confirm "Tetap coba SSL?" n; then ENABLE_SSL=false; warn "SSL dilewati. Panel akan dipasang via HTTP."; fi
     fi
   fi
   if [[ $ENABLE_SSL == true ]]; then APP_URL="https://$FQDN"; else APP_URL="http://$FQDN"; fi
@@ -966,6 +976,9 @@ run_panel_steps() {
   if [[ $SSL_OK == 1 ]]; then APP_URL="https://$FQDN"; else APP_URL="http://$FQDN"; fi
   if [[ $ENABLE_SSL == true && $SSL_OK != 1 ]]; then
     warn "SSL gagal diterbitkan; Panel berjalan via HTTP. Cek DNS lalu coba: certbot certonly --webroot -w ${PTERO_DIR}/public -d ${FQDN}"
+    if [[ $REQUIRE_SSL == true ]]; then
+      die "SSL wajib (--require-ssl) tetapi gagal terbit. Panel sudah terpasang via HTTP; perbaiki DNS/port 80 lalu terbitkan sertifikat manual."
+    fi
   fi
 }
 
