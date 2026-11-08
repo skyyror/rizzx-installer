@@ -554,10 +554,24 @@ step_php_repo() {
       fi ;;
   esac
   retry 3 apt_run update
-  if ! apt-cache policy "php${PHP_VER}-fpm" | grep -q 'Candidate: [0-9]'; then
-    echo "Paket php${PHP_VER}-fpm tidak tersedia di repo. Cek koneksi ke repo PHP / codename OS (${OS_CODENAME})."
+  local cand
+  cand="$(LC_ALL=C apt-cache policy "php${PHP_VER}-fpm" 2>/dev/null | awk '/Candidate:/ {print $2}')"
+  if [[ -z "$cand" || "$cand" == "(none)" ]] && [[ "$OS_ID" == "ubuntu" && "$OS_VER" != "24.04" ]]; then
+    echo "Kandidat php${PHP_VER}-fpm belum ada, mencoba menambahkan ulang PPA ondrej/php..."
+    retry 3 env LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php
+    retry 3 apt_run update
+    cand="$(LC_ALL=C apt-cache policy "php${PHP_VER}-fpm" 2>/dev/null | awk '/Candidate:/ {print $2}')"
+  fi
+  if [[ -z "$cand" || "$cand" == "(none)" ]]; then
+    echo "Paket php${PHP_VER}-fpm tidak tersedia di repo (OS: ${OS_ID} ${OS_VER} / ${OS_CODENAME})."
+    echo "── Diagnosa ──"
+    ls -1 /etc/apt/sources.list.d/ 2>&1 || true
+    LC_ALL=C apt-cache policy "php${PHP_VER}-fpm" 2>&1 | head -n 10 || true
+    LC_ALL=C apt-cache policy 2>/dev/null | grep -i -E 'ondrej|sury' | head -n 5 || true
+    echo "Cek koneksi ke ppa.launchpadcontent.net / packages.sury.org lalu jalankan ulang."
     return 1
   fi
+  echo "Kandidat php${PHP_VER}-fpm: $cand"
 }
 
 step_php() {
