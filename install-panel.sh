@@ -44,6 +44,8 @@ MAKE_API_KEY="${MAKE_API_KEY:-false}"
 ASSUME_YES="${ASSUME_YES:-false}"
 FORCE_OS="${FORCE_OS:-false}"
 FORCE="${FORCE:-false}"
+FORCE_SSL="${FORCE_SSL:-false}"      # bot V8: jangan batalkan SSL walau cek DNS/IP tidak cocok
+REQUIRE_SSL="${REQUIRE_SSL:-false}"  # bot V8: SSL gagal terbit => script exit != 0 (bukan diam-diam HTTP)
 QUIET="${QUIET:-false}"
 NODE_FQDN="${NODE_FQDN:-}"
 NODE_NAME="${NODE_NAME:-Node-RIZZX}"
@@ -64,6 +66,10 @@ if [[ $IS_TTY == 1 ]]; then
 else
   RST=''; BLD=''; RED=''; GRN=''; YEL=''; CYN=''; MAG=''; GRY=''
 fi
+# Mode bot V8 (dijalankan via SSH non-interaktif: NO_COLOR=1 / TERM=dumb)
+BOT_MODE=false
+if [[ -n "${NO_COLOR:-}" || "${TERM:-}" == "dumb" ]]; then BOT_MODE=true; fi
+HB_INTERVAL=20; if [[ $BOT_MODE == true ]]; then HB_INTERVAL=30; fi
 SPIN=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 ERR_SHOWN=0; STEP_NUM=0; STEP_TOTAL=0; SSL_OK=0; CHILD_PID=""; HB_PID=""; LAST_RC=0
 RAM_MB=0; DISK_MB=0; VIRT=""; OS_ID=""; OS_VER=""; OS_CODENAME=""; PUBLIC_IP=""
@@ -142,6 +148,8 @@ Opsi umum:
   --yes, -y             Tanpa pertanyaan (non-interaktif)
   --quiet, -q           Mode senyap: hanya spinner (log tetap ke file)
   --force               Dipakai bersama --yes untuk 'uninstall'
+  --force-ssl           Tetap lanjut SSL walau DNS/IP tidak cocok (dipakai bot)
+  --require-ssl         SSL wajib: gagal terbit => script exit != 0 (dipakai bot)
   --force-os            Lewati cek OS (risiko ditanggung sendiri)
 
 Opsi node (full / wings):
@@ -153,8 +161,9 @@ Opsi node (full / wings):
   --node-id <id>        [wings] ID node di Panel
   --token <ptla_...>    [wings] Application API key Panel
 
-Env bot juga diterima: FQDN, user_email, user_password, timezone,
-CONFIGURE_LETSENCRYPT.   Log: ${LOG_FILE}
+Env bot V8 diterima: FQDN, ADMIN_EMAIL, ADMIN_PASSWORD, TIMEZONE, ENABLE_SSL,
+FORCE_SSL, REQUIRE_SSL, NO_COLOR, TERM (+ user_email, user_password, timezone,
+CONFIGURE_LETSENCRYPT).   Log: ${LOG_FILE}
 EOF
 }
 
@@ -179,6 +188,8 @@ while [[ $# -gt 0 ]]; do
     --yes|-y)        ASSUME_YES="true"; shift ;;
     --quiet|-q)      QUIET="true"; shift ;;
     --force)         FORCE="true"; shift ;;
+    --force-ssl)     FORCE_SSL="true"; shift ;;
+    --require-ssl)   REQUIRE_SSL="true"; shift ;;
     --force-os)      FORCE_OS="true"; shift ;;
     --node-fqdn)     optval "$@"; NODE_FQDN="$2"; shift 2 ;;
     --node-name)     optval "$@"; NODE_NAME="$2"; shift 2 ;;
@@ -201,7 +212,7 @@ to_bool() {
   esac
 }
 ENABLE_SSL="$(to_bool "$ENABLE_SSL")"
-for _v in MAKE_API_KEY ASSUME_YES FORCE_OS FORCE QUIET; do
+for _v in MAKE_API_KEY ASSUME_YES FORCE_OS FORCE QUIET FORCE_SSL REQUIRE_SSL; do
   _b="$(to_bool "${!_v}")"; if [[ $_b == ask ]]; then _b=false; fi
   printf -v "$_v" '%s' "$_b"
 done
@@ -278,7 +289,7 @@ run_step() {
   else
     printf '\n  %s▶ [%s] %s%s\n' "$CYN$BLD" "$tag" "$label" "$RST"
     (
-      while sleep 20 && kill -0 "$parent" 2>/dev/null; do
+      while sleep "$HB_INTERVAL" && kill -0 "$parent" 2>/dev/null; do
         printf '    %s… masih berjalan (%ss) • proses: %s • log terakhir: %s%s\n' "$YEL" "$((SECONDS - start))" \
           "$( (pgrep -l 'apt|apt-get|dpkg|unattended-upgr|composer|php|certbot|mariadbd|curl|tar|docker' 2>/dev/null || true) | awk '{print $2}' | sort -u | head -4 | paste -sd, - )" \
           "$(tail -n1 "$LOG_FILE" 2>/dev/null | cut -c1-70)" "$RST"
@@ -317,17 +328,26 @@ run_step() {
   exit 1
 }
 
-chk_total=0; chk_fail=0
+chk_total=0; chk_fail=0; crit_fail=0
 chk() { # chk "label" perintah...
   local label="$1"; shift
   chk_total=$((chk_total + 1))
   if "$@" >>"$LOG_FILE" 2>&1; then ok "$label"; else bad "$label"; chk_fail=$((chk_fail + 1)); fi
 }
 
+chkc() { # seperti chk, tapi kegagalan dihitung KRITIS (bot tidak bisa memperbaikinya)
+  local before=$chk_fail
+  chk "$@"
+  if (( chk_fail > before )); then crit_fail=$((crit_fail + 1)); fi
+  return 0
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  PRE-FLIGHT
 # ══════════════════════════════════════════════════════════════════════════════
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
+COMPOSER_FLAGS=(--no-dev --optimize-autoloader --no-interaction --prefer-dist)
+if [[ $BOT_MODE == true ]]; then COMPOSER_FLAGS+=(--no-progress); else COMPOSER_FLAGS+=(-v); fi
 export COMPOSER_ALLOW_SUPERUSER=1 COMPOSER_PROCESS_TIMEOUT=0 COMPOSER_MEMORY_LIMIT=-1
 APT=(apt-get -y -q
   -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
@@ -432,7 +452,18 @@ preflight_panel() {
   for p in 80 443; do
     owner="$(port_owner "$p")"
     if [[ -n "$owner" && "$owner" != "nginx" ]]; then
-      die "Port $p dipakai oleh '$owner'. Hentikan dulu (mis. systemctl disable --now $owner) lalu jalankan ulang."
+      case "$owner" in
+        apache2|httpd|lighttpd|caddy)
+          if [[ $ASSUME_YES == true ]]; then
+            warn "Port $p dipakai webserver bawaan '$owner' (VPS baru). Dinonaktifkan agar Nginx bisa dipakai Panel."
+            systemctl disable --now "$owner" >>"$LOG_FILE" 2>&1 || true
+            sleep 1
+            [[ -z "$(port_owner "$p")" || "$(port_owner "$p")" == "nginx" ]] || die "Port $p masih dipakai '$(port_owner "$p")' setelah $owner dihentikan."
+          else
+            die "Port $p dipakai oleh '$owner'. Hentikan dulu (systemctl disable --now $owner) lalu jalankan ulang."
+          fi ;;
+        *) die "Port $p dipakai oleh '$owner'. Hentikan dulu (mis. systemctl disable --now $owner) lalu jalankan ulang." ;;
+      esac
     fi
   done
   ok "Port 80/443 tersedia"
@@ -487,7 +518,9 @@ gather_panel_config() {
   fi
   if [[ $ENABLE_SSL == true ]]; then
     if ! dns_matches "$FQDN"; then
-      if ! confirm "Tetap coba SSL?" n; then ENABLE_SSL=false; warn "SSL dilewati. Panel akan dipasang via HTTP."; fi
+      if [[ $FORCE_SSL == true || $REQUIRE_SSL == true ]]; then
+        warn "DNS belum cocok dengan IP VPS ini, tetapi SSL tetap dicoba (FORCE_SSL/REQUIRE_SSL aktif)."
+      elif ! confirm "Tetap coba SSL?" n; then ENABLE_SSL=false; warn "SSL dilewati. Panel akan dipasang via HTTP."; fi
     fi
   fi
   if [[ $ENABLE_SSL == true ]]; then APP_URL="https://$FQDN"; else APP_URL="http://$FQDN"; fi
@@ -640,7 +673,7 @@ SQL
 
 step_composer_install() {
   cd "$PTERO_DIR"
-  retry 2 composer install --no-dev --optimize-autoloader --no-interaction --prefer-dist -v
+  retry 2 composer install "${COMPOSER_FLAGS[@]}"
 }
 
 step_configure() {
@@ -812,9 +845,16 @@ step_nginx() {
 
 step_ssl() {
   apt_run install certbot
-  retry 2 certbot certonly --webroot -w "${PTERO_DIR}/public" -d "$FQDN" \
-    --non-interactive --agree-tos --register-unsafely-without-email --no-eff-email \
-    --keep-until-expiring --deploy-hook "systemctl reload nginx"
+  local cb_email=(--register-unsafely-without-email)
+  if [[ -n "$ADMIN_EMAIL" && "$ADMIN_EMAIL" != *@example.com ]]; then cb_email=(-m "$ADMIN_EMAIL"); fi
+  if ! retry 2 certbot certonly --webroot -w "${PTERO_DIR}/public" -d "$FQDN" \
+    --non-interactive --agree-tos "${cb_email[@]}" --no-eff-email \
+    --keep-until-expiring --deploy-hook "systemctl reload nginx"; then
+    echo "── certbot gagal; 25 baris terakhir letsencrypt.log ──"
+    tail -n 25 /var/log/letsencrypt/letsencrypt.log 2>/dev/null || true
+    echo "── port 80 ──"; ss -tlnp 2>/dev/null | grep -E ':80 ' || echo "(tidak ada listener port 80)"
+    return 1
+  fi
   [[ -f "/etc/letsencrypt/live/${FQDN}/fullchain.pem" ]] || { echo "sertifikat tidak terbentuk"; return 1; }
   cp /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-available/pterodactyl.conf.http.bak
   render_nginx_ssl >/etc/nginx/sites-available/pterodactyl.conf
@@ -1011,10 +1051,10 @@ admin_ok() {
 }
 validate_panel() {
   head1 "Validasi Panel"
-  chk "File .env Panel ada"                      test -f "$PTERO_DIR/.env"
-  chk "APP_KEY ter-generate"                     grep -Eq '^APP_KEY=base64:' "$PTERO_DIR/.env"
-  chk "php artisan p:info (DB & Redis OK)"       bash -c "cd '$PTERO_DIR' && php artisan p:info"
-  chk "User admin (root_admin) ada di database"  admin_ok
+  chkc "File .env Panel ada"                      test -f "$PTERO_DIR/.env"
+  chkc "APP_KEY ter-generate"                     grep -Eq '^APP_KEY=base64:' "$PTERO_DIR/.env"
+  chkc "php artisan p:info (DB & Redis OK)"       bash -c "cd '$PTERO_DIR' && php artisan p:info"
+  chkc "User admin (root_admin) ada di database"  admin_ok
   chk "Service nginx aktif"                      systemctl is-active --quiet nginx
   chk "Service php${PHP_VER}-fpm aktif"          systemctl is-active --quiet "php${PHP_VER}-fpm"
   chk "Service mariadb aktif"                    systemctl is-active --quiet mariadb
@@ -1082,8 +1122,13 @@ run_panel_steps() {
   run_step "Service queue (pteroq) & cron"                   step_runtime
   run_step "Konfigurasi vhost Nginx"                         step_nginx
   if [[ $ENABLE_SSL == true ]]; then
-    run_step -s "Menerbitkan SSL Let's Encrypt" step_ssl
-    if [[ $LAST_RC -eq 0 ]]; then SSL_OK=1; fi
+    if [[ $REQUIRE_SSL == true ]]; then
+      run_step "Menerbitkan SSL Let's Encrypt (wajib)" step_ssl   # gagal => exit != 0
+      SSL_OK=1
+    else
+      run_step -s "Menerbitkan SSL Let's Encrypt" step_ssl
+      if [[ $LAST_RC -eq 0 ]]; then SSL_OK=1; fi
+    fi
   fi
   if [[ $MAKE_API_KEY == true ]]; then run_step -s "Membuat Application API key" step_api_key; fi
   run_step "Finalisasi (APP_URL, cache, restart)"            step_finalize
@@ -1094,15 +1139,21 @@ run_panel_steps() {
 }
 
 panel_summary() {
-  local api=""; if [[ -s "$API_KEY_FILE" ]]; then api="$(cat "$API_KEY_FILE")"; fi
+  local api="" pw_show="$ADMIN_PASSWORD" db_show="$DB_PASS"
+  if [[ -s "$API_KEY_FILE" ]]; then api="$(cat "$API_KEY_FILE")"; fi
+  if [[ $BOT_MODE == true ]]; then   # log mengalir ke terminal Telegram: jangan bocorkan secret
+    if [[ $GEN_PW == 0 ]]; then pw_show="(sesuai yang dikirim bot)"; fi
+    db_show="(tersimpan di $CRED_FILE)"
+    if [[ -n "$api" ]]; then api="(tersimpan di $CRED_FILE)"; fi
+  fi
   echo
   if [[ $chk_fail -eq 0 ]]; then printf '  %s%s┏━━ 🎉  PANEL SIAP DIPAKAI  (%ss) ━━━━━━━━━━━━━━━━━┓%s\n' "$BLD" "$GRN" "$1" "$RST"
   else printf '  %s%s┏━━ ⚠  SELESAI DENGAN %s PERINGATAN (cek log) ━━━━━┓%s\n' "$BLD" "$YEL" "$chk_fail" "$RST"; fi
   printf '  %s┃%s  %-15s %s%s%s\n' "$GRN" "$RST" "Panel URL"   "$CYN" "$APP_URL" "$RST"
   printf '  %s┃%s  %-15s %s\n'     "$GRN" "$RST" "Username"    "$ADMIN_USER"
   printf '  %s┃%s  %-15s %s\n'     "$GRN" "$RST" "Email"       "$ADMIN_EMAIL"
-  printf '  %s┃%s  %-15s %s%s%s\n' "$GRN" "$RST" "Password"    "$YEL" "$ADMIN_PASSWORD" "$RST"
-  printf '  %s┃%s  %-15s %s\n'     "$GRN" "$RST" "DB password" "$DB_PASS"
+  printf '  %s┃%s  %-15s %s%s%s\n' "$GRN" "$RST" "Password"    "$YEL" "$pw_show" "$RST"
+  printf '  %s┃%s  %-15s %s\n'     "$GRN" "$RST" "DB password" "$db_show"
   if [[ -n "$api" ]]; then printf '  %s┃%s  %-15s %s\n' "$GRN" "$RST" "API key (ptla)" "$api"; fi
   printf '  %s┃%s\n' "$GRN" "$RST"
   printf '  %s┃%s  %s💾 Kredensial : %s (chmod 600)%s\n' "$GRN" "$RST" "$GRY" "$CRED_FILE" "$RST"
@@ -1112,6 +1163,7 @@ panel_summary() {
 }
 
 bot_note() {
+  if [[ $BOT_MODE == true ]]; then info "Panel selesai. Bot V8 melanjutkan: API key, Node, Wings, allocation, egg."; return 0; fi
   head1 "Opsional: integrasi bot RIZZX V8"
   info "Admin ${BLD}${ADMIN_USER}${RST} (ID 1) cocok dengan PROTECT_ROOT_ADMIN_ID=1 dan pembuat API key bot."
   info "Isi PTERODACTYL_APPLICATION_API_KEY di .env bot dengan key dari --api-key, atau kosongkan agar bot membuat sendiri."
@@ -1131,7 +1183,13 @@ cmd_panel() {
   write_creds
   panel_summary "$((SECONDS - t0))"
   bot_note
-  [[ $chk_fail -eq 0 ]] || exit 1
+  if [[ $chk_fail -ne 0 ]]; then
+    if [[ $BOT_MODE == true && $crit_fail -eq 0 ]]; then
+      warn "Ada $chk_fail pemeriksaan non-kritis gagal (service/HTTP). Bot V8 akan memvalidasi & memperbaiki sendiri (PHP-FPM, SSL)."
+    else
+      exit 1
+    fi
+  fi
 }
 
 cmd_wings() {
@@ -1388,7 +1446,7 @@ step_update_panel() {
   tar -xzf /tmp/rizzx-panel.tar.gz -C "$PTERO_DIR"
   rm -f /tmp/rizzx-panel.tar.gz
   chmod -R 755 storage/* bootstrap/cache
-  composer install --no-dev --optimize-autoloader --no-interaction --prefer-dist -v
+  composer install "${COMPOSER_FLAGS[@]}"
   php artisan view:clear
   php artisan config:clear
   php artisan migrate --seed --force
