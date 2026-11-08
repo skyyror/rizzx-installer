@@ -1,21 +1,25 @@
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════════════════════════════
-#  RIZZX • Pterodactyl All-in-One Installer  v2.0
+#  RIZZX • Pterodactyl All-in-One Installer  v3.0  (LIVE LOG edition)
 #
-#  Bisa dipakai MANUAL (tanpa bot Telegram) dan tetap kompatibel dengan bot V8.
+#  Menu interaktif : sudo bash install-panel.sh
+#  Panel           : sudo bash install-panel.sh panel  --fqdn panel.domain.com --ssl
+#  Wings           : sudo bash install-panel.sh wings  --panel-url https://panel.domain.com --node-id 1 --token ptla_xxx
+#  Panel+Wings+Node: sudo bash install-panel.sh full   --fqdn panel.domain.com --ssl --yes
+#  Lainnya         : status | doctor | admin | update | uninstall | logs | --help
 #
-#    Menu interaktif : sudo bash install-panel.sh
-#    Panel           : sudo bash install-panel.sh panel  --fqdn panel.domain.com --ssl
-#    Wings           : sudo bash install-panel.sh wings  --panel-url https://panel.domain.com --node-id 1 --token ptla_xxx
-#    Panel+Wings+Node: sudo bash install-panel.sh full   --fqdn panel.domain.com --ssl --yes
-#    Lainnya         : status | admin | update | --help
-#
-#  Hasil Panel sama seperti yang diharapkan bot V8:
-#    /var/www/pterodactyl • admin "admin" (ID 1) • pteroq + cron • pterodactyl.conf
+#  Perubahan utama v3.0:
+#   - Log SELALU tampil live (+ disimpan ke file). Mode senyap: --quiet
+#   - Heartbeat tiap 20 dtk: lama berjalan, proses aktif, baris log terakhir
+#   - Penanganan lock apt/dpkg (unattended-upgrades), apt timeout + IPv4
+#   - Retry otomatis untuk langkah yang butuh jaringan
+#   - Perintah baru: doctor (diagnosa + perbaikan), uninstall (bersihkan sisa
+#     instalasi gagal), logs (ikuti log)
+#   - Kompatibel dengan bot V8 (admin "admin" ID 1, pteroq, cron, env bot)
 # ══════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
-VERSION="2.0.0"
+VERSION="3.0.0"
 LOG_FILE="/var/log/rizzx-panel-install.log"
 PTERO_DIR="/var/www/pterodactyl"
 CRED_FILE="/root/rizzx-panel-credentials.txt"
@@ -39,8 +43,8 @@ PANEL_VERSION="${PANEL_VERSION:-latest}"
 MAKE_API_KEY="${MAKE_API_KEY:-false}"
 ASSUME_YES="${ASSUME_YES:-false}"
 FORCE_OS="${FORCE_OS:-false}"
-FORCE_SSL="${FORCE_SSL:-false}"      # true = jangan batalkan SSL walau DNS tampak tidak cocok
-REQUIRE_SSL="${REQUIRE_SSL:-false}"  # true = exit != 0 bila SSL gagal terbit (dipakai bot)
+FORCE="${FORCE:-false}"
+QUIET="${QUIET:-false}"
 NODE_FQDN="${NODE_FQDN:-}"
 NODE_NAME="${NODE_NAME:-Node-RIZZX}"
 NODE_RAM="${NODE_RAM:-}"
@@ -54,15 +58,14 @@ WINGS_TOKEN="${WINGS_TOKEN:-}"
 IS_TTY=0
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then IS_TTY=1; fi
 if [[ $IS_TTY == 1 ]]; then
-  RST=$'\e[0m'; BLD=$'\e[1m'; DIM=$'\e[2m'
+  RST=$'\e[0m'; BLD=$'\e[1m'
   RED=$'\e[38;5;203m'; GRN=$'\e[38;5;84m'; YEL=$'\e[38;5;221m'
   CYN=$'\e[38;5;81m';  MAG=$'\e[38;5;177m'; GRY=$'\e[38;5;245m'
 else
-  RST=''; BLD=''; DIM=''; RED=''; GRN=''; YEL=''; CYN=''; MAG=''; GRY=''
+  RST=''; BLD=''; RED=''; GRN=''; YEL=''; CYN=''; MAG=''; GRY=''
 fi
-CLR=''; if [[ $IS_TTY == 1 ]]; then CLR=$'\r\e[2K'; fi
 SPIN=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-ERR_SHOWN=0; STEP_NUM=0; STEP_TOTAL=0; SSL_OK=0; CHILD_PID=""
+ERR_SHOWN=0; STEP_NUM=0; STEP_TOTAL=0; SSL_OK=0; CHILD_PID=""; HB_PID=""; LAST_RC=0
 RAM_MB=0; DISK_MB=0; VIRT=""; OS_ID=""; OS_VER=""; OS_CODENAME=""; PUBLIC_IP=""
 HAVE_TTY=0; GEN_PW=0; IS_IP=0; APP_URL=""; DB_PASS=""; PHP_SOCK=""
 
@@ -81,19 +84,21 @@ banner() {
     if [[ $IS_TTY == 1 ]]; then printf '   \e[1;38;5;%sm%s\e[0m\n' "${grad[$i]}" "${lines[$i]}"
     else printf '   %s\n' "${lines[$i]}"; fi
   done
-  printf '   %s%sPterodactyl All-in-One Installer%s %s• v%s%s\n' "$BLD" "$MAG" "$RST" "$GRY" "$VERSION" "$RST"
+  printf '   %s%sPterodactyl All-in-One Installer%s %s• v%s • live log%s\n' "$BLD" "$MAG" "$RST" "$GRY" "$VERSION" "$RST"
   printf '   %s──────────────────────────────────────────────%s\n\n' "$GRY" "$RST"
 }
 
-ok()   { printf '  %s✔%s %s\n' "$GRN" "$RST" "$*"; }
-warn() { printf '  %s⚠%s %s\n' "$YEL" "$RST" "$*"; }
-bad()  { printf '  %s✘%s %s\n' "$RED" "$RST" "$*"; }
+logf() { if [[ -w "$LOG_FILE" ]]; then printf '[%s] %s\n' "$(date '+%T')" "$*" >>"$LOG_FILE"; fi; return 0; }
+ok()   { printf '  %s✔%s %s\n' "$GRN" "$RST" "$*"; logf "OK   $*"; }
+warn() { printf '  %s⚠%s %s\n' "$YEL" "$RST" "$*"; logf "WARN $*"; }
+bad()  { printf '  %s✘%s %s\n' "$RED" "$RST" "$*"; logf "FAIL $*"; }
 info() { printf '  %s➜%s %s\n' "$CYN" "$RST" "$*"; }
 head1(){ printf '\n  %s%s%s\n\n' "$BLD" "$*" "$RST"; }
 die()  { ERR_SHOWN=1; echo; bad "${RED}${BLD}$*${RST}"; echo; exit 1; }
 
 on_exit() {
   local rc=$?
+  if [[ -n "$HB_PID" ]]; then kill "$HB_PID" 2>/dev/null || true; fi
   if [[ $IS_TTY == 1 ]]; then printf '\e[?25h'; fi
   if [[ $rc -ne 0 && $ERR_SHOWN -eq 0 ]]; then
     echo; bad "Script berhenti tak terduga (kode $rc). Cek log: $LOG_FILE"
@@ -102,6 +107,7 @@ on_exit() {
 }
 on_int() {
   if [[ -n "$CHILD_PID" ]]; then kill "$CHILD_PID" 2>/dev/null || true; fi
+  if [[ -n "$HB_PID" ]]; then kill "$HB_PID" 2>/dev/null || true; fi
   ERR_SHOWN=1; echo; warn "Dibatalkan oleh user."; exit 130
 }
 trap on_exit EXIT
@@ -119,8 +125,11 @@ Perintah:
   wings      Install Docker + Wings (VPS node)
   full       Panel + Wings + Location & Node otomatis di satu VPS
   status     Cek kondisi Panel / Wings / service / SSL
+  doctor     Diagnosa masalah + perbaikan otomatis (restart, permission, cache)
   admin      Tambah akun admin Panel
   update     Update Panel ke rilis terbaru (backup otomatis)
+  uninstall  Hapus Panel (juga membersihkan sisa instalasi yang gagal)
+  logs       Ikuti log instalasi secara live
 
 Opsi umum:
   --fqdn <domain>       Domain Panel (atau IP)
@@ -131,9 +140,9 @@ Opsi umum:
   --version <vX.Y.Z>    Versi Panel (default latest)
   --api-key             Buat Application API key (ptla_) untuk bot/API
   --yes, -y             Tanpa pertanyaan (non-interaktif)
+  --quiet, -q           Mode senyap: hanya spinner (log tetap ke file)
+  --force               Dipakai bersama --yes untuk 'uninstall'
   --force-os            Lewati cek OS (risiko ditanggung sendiri)
-  --force-ssl           Tetap coba SSL walau DNS tampak tidak cocok
-  --require-ssl         Exit dengan error bila SSL gagal terbit
 
 Opsi node (full / wings):
   --node-fqdn <domain>  FQDN node (default = FQDN Panel)
@@ -155,29 +164,30 @@ for a in "$@"; do
   if [[ "$a" == --*=* ]]; then args+=("${a%%=*}" "${a#*=}"); else args+=("$a"); fi
 done
 if ((${#args[@]})); then set -- "${args[@]}"; else set --; fi
+optval() { [[ $# -ge 2 && -n "${2:-}" ]] || die "Opsi $1 membutuhkan nilai."; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    panel|wings|full|status|admin|update|menu) CMD="$1"; shift ;;
-    --fqdn)          FQDN="${2:-}"; shift 2 ;;
-    --email)         ADMIN_EMAIL="${2:-}"; shift 2 ;;
-    --password)      ADMIN_PASSWORD="${2:-}"; shift 2 ;;
-    --timezone)      TIMEZONE="${2:-}"; shift 2 ;;
-    --version)       PANEL_VERSION="${2:-latest}"; shift 2 ;;
+    panel|wings|full|status|doctor|admin|update|uninstall|logs|menu) CMD="$1"; shift ;;
+    --fqdn)          optval "$@"; FQDN="$2"; shift 2 ;;
+    --email)         optval "$@"; ADMIN_EMAIL="$2"; shift 2 ;;
+    --password)      optval "$@"; ADMIN_PASSWORD="$2"; shift 2 ;;
+    --timezone)      optval "$@"; TIMEZONE="$2"; shift 2 ;;
+    --version)       optval "$@"; PANEL_VERSION="$2"; shift 2 ;;
     --ssl)           ENABLE_SSL="true"; shift ;;
     --no-ssl)        ENABLE_SSL="false"; shift ;;
     --api-key)       MAKE_API_KEY="true"; shift ;;
     --yes|-y)        ASSUME_YES="true"; shift ;;
+    --quiet|-q)      QUIET="true"; shift ;;
+    --force)         FORCE="true"; shift ;;
     --force-os)      FORCE_OS="true"; shift ;;
-    --force-ssl)     FORCE_SSL="true"; shift ;;
-    --require-ssl)   REQUIRE_SSL="true"; shift ;;
-    --node-fqdn)     NODE_FQDN="${2:-}"; shift 2 ;;
-    --node-name)     NODE_NAME="${2:-}"; shift 2 ;;
-    --node-ram)      NODE_RAM="${2:-}"; shift 2 ;;
-    --location)      LOC_SHORT="${2:-}"; shift 2 ;;
-    --location-name) LOC_LONG="${2:-}"; shift 2 ;;
-    --panel-url)     WINGS_PANEL_URL="${2:-}"; shift 2 ;;
-    --node-id)       WINGS_NODE_ID="${2:-}"; shift 2 ;;
-    --token)         WINGS_TOKEN="${2:-}"; shift 2 ;;
+    --node-fqdn)     optval "$@"; NODE_FQDN="$2"; shift 2 ;;
+    --node-name)     optval "$@"; NODE_NAME="$2"; shift 2 ;;
+    --node-ram)      optval "$@"; NODE_RAM="$2"; shift 2 ;;
+    --location)      optval "$@"; LOC_SHORT="$2"; shift 2 ;;
+    --location-name) optval "$@"; LOC_LONG="$2"; shift 2 ;;
+    --panel-url)     optval "$@"; WINGS_PANEL_URL="$2"; shift 2 ;;
+    --node-id)       optval "$@"; WINGS_NODE_ID="$2"; shift 2 ;;
+    --token)         optval "$@"; WINGS_TOKEN="$2"; shift 2 ;;
     -h|--help)       usage; exit 0 ;;
     *) usage; die "Opsi/perintah tidak dikenal: $1" ;;
   esac
@@ -191,11 +201,11 @@ to_bool() {
   esac
 }
 ENABLE_SSL="$(to_bool "$ENABLE_SSL")"
-MAKE_API_KEY="$(to_bool "$MAKE_API_KEY")"; if [[ $MAKE_API_KEY == ask ]]; then MAKE_API_KEY=false; fi
-ASSUME_YES="$(to_bool "$ASSUME_YES")";     if [[ $ASSUME_YES == ask ]]; then ASSUME_YES=false; fi
-FORCE_OS="$(to_bool "$FORCE_OS")";         if [[ $FORCE_OS == ask ]]; then FORCE_OS=false; fi
-FORCE_SSL="$(to_bool "$FORCE_SSL")";       if [[ $FORCE_SSL == ask ]]; then FORCE_SSL=false; fi
-REQUIRE_SSL="$(to_bool "$REQUIRE_SSL")";   if [[ $REQUIRE_SSL == ask ]]; then REQUIRE_SSL=false; fi
+for _v in MAKE_API_KEY ASSUME_YES FORCE_OS FORCE QUIET; do
+  _b="$(to_bool "${!_v}")"; if [[ $_b == ask ]]; then _b=false; fi
+  printf -v "$_v" '%s' "$_b"
+done
+unset _v _b
 
 # ── Input interaktif (baca dari /dev/tty → aman untuk `bash <(curl ...)`) ────
 if [[ $ASSUME_YES != true ]] && (exec </dev/tty) 2>/dev/null; then HAVE_TTY=1; fi
@@ -217,7 +227,7 @@ confirm() { # confirm "Pertanyaan" default(y/n)
 }
 rand_str() {
   local n="${1:-24}" s=""
-  s="$(openssl rand -base64 $((n * 3)) | tr -dc 'A-Za-z0-9' | head -c "$n" || true)"
+  s="$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c "$n" || true)"
   printf '%s' "$s"
 }
 bar() { # bar persen -> ▰▰▰▱▱▱
@@ -226,48 +236,84 @@ bar() { # bar persen -> ▰▰▰▱▱▱
   for ((i = 0; i < w; i++)); do if (( i < f )); then out+="▰"; else out+="▱"; fi; done
   printf '%s' "$out"
 }
-dl() { curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 20 -o "$2" "$1"; }
+dl() { curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 20 --max-time 900 -o "$2" "$1"; }
+retry() { # retry N perintah...
+  local n="$1" i=1; shift
+  until "$@"; do
+    if (( i >= n )); then echo "Gagal setelah $n percobaan: $*"; return 1; fi
+    echo "Percobaan $i/$n gagal, ulangi dalam 5 detik: $*"; i=$((i + 1)); sleep 5
+  done
+}
 
-# ── Runner step dengan spinner + progress bar ────────────────────────────────
-run_step() { # run_step [-s] "Label" fungsi [arg...]   (-s = soft: gagal tidak menghentikan script)
-  local soft=0; if [[ "$1" == "-s" ]]; then soft=1; shift; fi
+# ══════════════════════════════════════════════════════════════════════════════
+#  RUNNER STEP — LIVE LOG
+#  run_step [-s] "Label" fungsi [arg...]
+#    -s = soft: gagal tidak menghentikan script (cek $LAST_RC setelahnya)
+#  JANGAN panggil run_step di dalam `if`/`||` agar `set -e` tetap aktif di step.
+# ══════════════════════════════════════════════════════════════════════════════
+run_step() {
+  local soft=0; if [[ "${1:-}" == "-s" ]]; then soft=1; shift; fi
   local label="$1"; shift
   STEP_NUM=$((STEP_NUM + 1))
-  local tag pct start=$SECONDS rc=0 i=0
+  local tag pct start=$SECONDS rc=0 parent=$$ i=0
   tag="$(printf '%02d/%02d' "$STEP_NUM" "$STEP_TOTAL")"
   pct=$(( STEP_NUM * 100 / STEP_TOTAL ))
   printf '\n### [%s] %s\n' "$tag" "$label" >>"$LOG_FILE"
-  ( set -Eeuo pipefail; "$@" ) >>"$LOG_FILE" 2>&1 &
-  CHILD_PID=$!
-  if [[ $IS_TTY == 1 ]]; then
-    printf '\e[?25l'
-    while kill -0 "$CHILD_PID" 2>/dev/null; do
-      printf '\r\e[2K  %s%s%s %s[%s]%s %s %s%ss%s' "$CYN" "${SPIN[i % 10]}" "$RST" "$GRY" "$tag" "$RST" "$label" "$GRY" "$((SECONDS - start))" "$RST"
-      i=$((i + 1)); sleep 0.1
-    done
-    printf '\e[?25h'
+
+  if [[ $QUIET == true ]]; then
+    ( set -Eeuo pipefail; "$@" ) </dev/null >>"$LOG_FILE" 2>&1 &
+    CHILD_PID=$!
+    if [[ $IS_TTY == 1 ]]; then
+      printf '\e[?25l'
+      while kill -0 "$CHILD_PID" 2>/dev/null; do
+        printf '\r\e[2K  %s%s%s %s[%s]%s %s %s%ss%s' "$CYN" "${SPIN[i % 10]}" "$RST" "$GRY" "$tag" "$RST" "$label" "$GRY" "$((SECONDS - start))" "$RST"
+        i=$((i + 1)); sleep 0.1
+      done
+      printf '\e[?25h\r\e[2K'
+    else
+      printf '  … [%s] %s\n' "$tag" "$label"
+    fi
+    set +e; wait "$CHILD_PID"; rc=$?; set -e
+    CHILD_PID=""
   else
-    printf '  … [%s] %s\n' "$tag" "$label"
+    printf '\n  %s▶ [%s] %s%s\n' "$CYN$BLD" "$tag" "$label" "$RST"
+    (
+      while sleep 20 && kill -0 "$parent" 2>/dev/null; do
+        printf '    %s… masih berjalan (%ss) • proses: %s • log terakhir: %s%s\n' "$YEL" "$((SECONDS - start))" \
+          "$( (pgrep -l 'apt|apt-get|dpkg|unattended-upgr|composer|php|certbot|mariadbd|curl|tar|docker' 2>/dev/null || true) | awk '{print $2}' | sort -u | head -4 | paste -sd, - )" \
+          "$(tail -n1 "$LOG_FILE" 2>/dev/null | cut -c1-70)" "$RST"
+      done
+    ) &
+    HB_PID=$!
+    set +e
+    ( set -Eeuo pipefail; "$@" ) </dev/null 2>&1 | tee -a "$LOG_FILE" | sed -u 's/^/    │ /'
+    rc=${PIPESTATUS[0]}
+    set -e
+    kill "$HB_PID" 2>/dev/null || true
+    wait "$HB_PID" 2>/dev/null || true
+    HB_PID=""
   fi
-  wait "$CHILD_PID" || rc=$?
-  CHILD_PID=""
+
+  LAST_RC=$rc
   local took=$((SECONDS - start))
   if [[ $rc -eq 0 ]]; then
-    printf '%s  %s✔%s %s[%s]%s %s %s(%ss) %s %s%%%s\n' "$CLR" "$GRN" "$RST" "$GRY" "$tag" "$RST" "$label" "$GRY" "$took" "$(bar "$pct")" "$pct" "$RST"
+    printf '  %s✔%s %s[%s]%s %s %s(%ss) %s %s%%%s\n' "$GRN" "$RST" "$GRY" "$tag" "$RST" "$label" "$GRY" "$took" "$(bar "$pct")" "$pct" "$RST"
     return 0
   fi
   if [[ $soft -eq 1 ]]; then
-    printf '%s  %s⚠%s %s[%s]%s %s %s(dilewati, kode %s)%s\n' "$CLR" "$YEL" "$RST" "$GRY" "$tag" "$RST" "$label" "$GRY" "$rc" "$RST"
-    return "$rc"
+    printf '  %s⚠%s %s[%s]%s %s %s(dilewati, kode %s)%s\n' "$YEL" "$RST" "$GRY" "$tag" "$RST" "$label" "$GRY" "$rc" "$RST"
+    return 0
   fi
-  printf '%s  %s✘%s %s[%s]%s %s\n' "$CLR" "$RED" "$RST" "$GRY" "$tag" "$RST" "$label"
-  echo; echo "  ${RED}${BLD}── 20 baris log terakhir ──${RST}"
-  tail -n 20 "$LOG_FILE" | sed 's/^/    /'
-  echo
+  printf '  %s✘%s %s[%s]%s %s %s(kode %s)%s\n' "$RED" "$RST" "$GRY" "$tag" "$RST" "$label" "$GRY" "$rc" "$RST"
+  if [[ $QUIET == true ]]; then
+    echo; echo "  ${RED}${BLD}── 25 baris log terakhir ──${RST}"
+    tail -n 25 "$LOG_FILE" | sed 's/^/    /'
+  fi
   ERR_SHOWN=1
-  bad "Gagal di langkah: $label"
+  echo
+  bad "Gagal di langkah: $label  (lihat pesan error tepat di atas)"
   info "Log lengkap : $LOG_FILE"
-  info "Perbaiki masalahnya lalu jalankan ulang. Tidak ada data yang dihapus otomatis."
+  info "Jika instalasi Panel setengah jalan, bersihkan dulu:  sudo bash install-panel.sh uninstall"
   exit 1
 }
 
@@ -282,20 +328,35 @@ chk() { # chk "label" perintah...
 #  PRE-FLIGHT
 # ══════════════════════════════════════════════════════════════════════════════
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
-APT=(apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o DPkg::Lock::Timeout=300 -o Acquire::Retries=5)
+export COMPOSER_ALLOW_SUPERUSER=1 COMPOSER_PROCESS_TIMEOUT=0 COMPOSER_MEMORY_LIMIT=-1
+APT=(apt-get -y -q
+  -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+  -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3
+  -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30
+  -o Acquire::ForceIPv4=true -o APT::Color=0)
 
+APT_PROCS='apt|apt-get|dpkg|aptitude|unattended-upgr|packagekitd'
 wait_apt() {
-  local i=0
-  while pgrep -x 'apt|apt-get|dpkg|aptitude|unattended-upgr' >/dev/null 2>&1; do
-    i=$((i + 1)); if [[ $i -gt 100 ]]; then break; fi
+  local i=0 holders
+  while pgrep -x "$APT_PROCS" >/dev/null 2>&1; do
+    if [[ $i -eq 0 ]]; then
+      holders="$(pgrep -l -x "$APT_PROCS" | awk '{print $2}' | sort -u | paste -sd, -)"
+      echo "apt/dpkg sedang dipakai proses lain ($holders). Menghentikan unattended-upgrades/packagekit..."
+      timeout 60 systemctl stop unattended-upgrades 2>/dev/null || true
+      timeout 20 systemctl stop packagekit 2>/dev/null || true
+    fi
+    i=$((i + 1))
+    if [[ $i -gt 100 ]]; then echo "Menunggu lock apt > 5 menit, lanjut paksa."; break; fi
+    if (( i % 5 == 0 )); then echo "… masih menunggu apt/dpkg lock ($((i * 3)) dtk)"; fi
     sleep 3
   done
+  return 0
 }
 apt_run() { wait_apt; "${APT[@]}" "$@"; }
 
-need_root() { [[ $EUID -eq 0 ]] || die "Jalankan sebagai root:  sudo bash $0"; }
-init_log()  { mkdir -p "$(dirname "$LOG_FILE")"; touch "$LOG_FILE"; chmod 600 "$LOG_FILE"; printf '\n===== %s • %s =====\n' "$(date '+%F %T')" "${CMD:-menu}" >>"$LOG_FILE"; }
-panel_installed() { [[ -f "$PTERO_DIR/artisan" && -f "$PTERO_DIR/.env" ]]; }
+need_root() { [[ $EUID -eq 0 ]] || die "Jalankan sebagai root:  sudo bash install-panel.sh"; }
+init_log()  { mkdir -p "$(dirname "$LOG_FILE")"; touch "$LOG_FILE"; chmod 600 "$LOG_FILE"; printf '\n===== %s • %s • v%s =====\n' "$(date '+%F %T')" "${CMD:-menu}" "$VERSION" >>"$LOG_FILE"; }
+panel_installed() { [[ -f "$PTERO_DIR/artisan" && -f "$PTERO_DIR/.env" ]] && grep -Eq '^APP_KEY=base64:' "$PTERO_DIR/.env"; }
 wings_installed() { [[ -x /usr/local/bin/wings ]]; }
 mysql_cli() { command -v mariadb || command -v mysql; }
 
@@ -304,7 +365,7 @@ port_owner() {
   ss -H -tlnp "sport = :$1" 2>/dev/null | grep -o '"[^"]*"' | head -n1 | tr -d '"' || true
 }
 
-preflight_common() { # $1 = label mode: panel | wings
+preflight_common() { # $1 = mode: panel | wings
   local mode="$1"
   head1 "Pre-flight check"
   [[ -r /etc/os-release ]] || die "/etc/os-release tidak ditemukan; OS tidak dikenali."
@@ -339,13 +400,24 @@ preflight_common() { # $1 = label mode: panel | wings
   elif (( DISK_MB < 5120 )); then warn "Disk kosong ${DISK_MB} MB (disarankan > 5 GB)."
   else ok "Disk kosong: ${DISK_MB} MB"; fi
 
+  # lock apt yang sedang dipegang proses lain (penyebab umum "diam saja")
+  if pgrep -x "$APT_PROCS" >/dev/null 2>&1; then
+    warn "Ada proses apt/dpkg lain berjalan: $(pgrep -l -x "$APT_PROCS" | awk '{print $2}' | sort -u | paste -sd, -). Akan dihentikan/ditunggu otomatis."
+  else ok "Tidak ada lock apt/dpkg"; fi
+
   if ! command -v curl >/dev/null 2>&1; then
     info "Memasang curl dulu..."
-    { apt-get update -q && apt_run install curl ca-certificates; } >>"$LOG_FILE" 2>&1 || die "Gagal memasang curl."
+    { apt-get update -q -o Acquire::ForceIPv4=true && apt_run install curl ca-certificates; } 2>&1 | tee -a "$LOG_FILE" | sed -u 's/^/    │ /' || true
+    command -v curl >/dev/null 2>&1 || die "Gagal memasang curl."
   fi
-  curl -fsSI --max-time 10 https://github.com >/dev/null 2>&1 || die "Tidak bisa menjangkau github.com (cek internet/DNS/firewall VPS)."
+  getent hosts github.com >/dev/null 2>&1 || die "DNS gagal me-resolve github.com (cek /etc/resolv.conf / jaringan VPS)."
+  curl -fsSI --max-time 15 https://github.com >/dev/null 2>&1 || die "Tidak bisa menjangkau github.com (cek internet/firewall VPS)."
   ok "Koneksi internet / GitHub OK"
   PUBLIC_IP="$(curl -fsS4 --max-time 6 https://api.ipify.org 2>/dev/null || curl -fsS4 --max-time 6 https://ifconfig.me 2>/dev/null || true)"
+  if [[ -n "$PUBLIC_IP" ]]; then ok "IP publik: $PUBLIC_IP"; fi
+  if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo yes)" == "no" ]]; then
+    warn "Jam sistem belum sinkron NTP; ini bisa menggagalkan apt/SSL. Jalankan: timedatectl set-ntp true"
+  fi
 }
 
 preflight_panel() {
@@ -353,7 +425,7 @@ preflight_panel() {
     die "Panel sudah terpasang di $PTERO_DIR. Dibatalkan agar database/config lama tidak tertimpa. (Gunakan: update)"
   fi
   if [[ -d "$PTERO_DIR" ]] && [[ -n "$(ls -A "$PTERO_DIR" 2>/dev/null)" ]]; then
-    die "Direktori $PTERO_DIR sudah ada dan tidak kosong. Pindahkan/hapus dulu secara manual."
+    die "Direktori $PTERO_DIR berisi sisa instalasi yang tidak lengkap. Bersihkan dengan:  sudo bash install-panel.sh uninstall"
   fi
   ok "Belum ada Panel di $PTERO_DIR"
   local p owner
@@ -415,8 +487,7 @@ gather_panel_config() {
   fi
   if [[ $ENABLE_SSL == true ]]; then
     if ! dns_matches "$FQDN"; then
-      if [[ $FORCE_SSL == true ]]; then warn "Lanjut mencoba SSL karena --force-ssl."
-      elif ! confirm "Tetap coba SSL?" n; then ENABLE_SSL=false; warn "SSL dilewati. Panel akan dipasang via HTTP."; fi
+      if ! confirm "Tetap coba SSL?" n; then ENABLE_SSL=false; warn "SSL dilewati. Panel akan dipasang via HTTP."; fi
     fi
   fi
   if [[ $ENABLE_SSL == true ]]; then APP_URL="https://$FQDN"; else APP_URL="http://$FQDN"; fi
@@ -443,13 +514,13 @@ summary_box() { # summary_box "baris" ...
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  LANGKAH-LANGKAH PANEL (jalan di subshell via run_step; output → log)
+#  LANGKAH-LANGKAH PANEL (jalan di subshell via run_step; output → layar + log)
 # ══════════════════════════════════════════════════════════════════════════════
 ensure_swap() {
   local swap; swap="$(awk '/SwapTotal/ {print int($2/1024)}' /proc/meminfo)"
   if (( RAM_MB < 2000 && swap == 0 && DISK_MB > 6000 )) && [[ "$VIRT" != openvz && "$VIRT" != lxc* && ! -e /swapfile ]]; then
     echo "RAM kecil & tanpa swap: membuat /swapfile 2G agar Composer tidak OOM"
-    fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048
+    fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=progress
     chmod 600 /swapfile
     mkswap /swapfile
     swapon /swapfile
@@ -462,9 +533,9 @@ step_base() {
   wait_apt
   dpkg --configure -a || true
   apt_run --fix-broken install || true
-  apt_run update
+  retry 3 apt_run update
   apt_run install ca-certificates curl gnupg lsb-release apt-transport-https \
-    tar unzip git cron openssl iproute2 procps
+    tar unzip git cron openssl iproute2 procps psmisc
   if [[ "$OS_ID" == "ubuntu" ]]; then apt_run install software-properties-common; fi
   ensure_swap
 }
@@ -473,16 +544,20 @@ step_php_repo() {
   case "$OS_ID" in
     ubuntu)
       if [[ "$OS_VER" == "24.04" ]]; then echo "Ubuntu 24.04: PHP ${PHP_VER} sudah ada di repo resmi."
-      else LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php; fi ;;
+      else retry 3 env LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php; fi ;;
     debian)
       if [[ ! -f /etc/apt/sources.list.d/php.list ]]; then
-        dl https://packages.sury.org/debsuryorg-archive-keyring.deb /tmp/debsuryorg-archive-keyring.deb
+        retry 3 dl https://packages.sury.org/debsuryorg-archive-keyring.deb /tmp/debsuryorg-archive-keyring.deb
         dpkg -i /tmp/debsuryorg-archive-keyring.deb
         echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] https://packages.sury.org/php/ ${OS_CODENAME} main" >/etc/apt/sources.list.d/php.list
         rm -f /tmp/debsuryorg-archive-keyring.deb
       fi ;;
   esac
-  apt_run update
+  retry 3 apt_run update
+  if ! apt-cache policy "php${PHP_VER}-fpm" | grep -q 'Candidate: [0-9]'; then
+    echo "Paket php${PHP_VER}-fpm tidak tersedia di repo. Cek koneksi ke repo PHP / codename OS (${OS_CODENAME})."
+    return 1
+  fi
 }
 
 step_php() {
@@ -498,12 +573,18 @@ step_php() {
 step_services() {
   apt_run install mariadb-server redis-server nginx cron
   systemctl enable --now mariadb redis-server nginx cron
+  local i
+  for i in $(seq 1 30); do
+    if "$(command -v mariadb-admin || command -v mysqladmin)" ping >/dev/null 2>&1; then echo "MariaDB siap"; return 0; fi
+    echo "Menunggu MariaDB siap ($i/30)..."; sleep 2
+  done
+  echo "MariaDB tidak merespons."; return 1
 }
 
 step_composer() {
-  dl https://getcomposer.org/download/latest-2.x/composer.phar /usr/local/bin/composer
+  retry 3 dl https://getcomposer.org/download/latest-2.x/composer.phar /usr/local/bin/composer
   chmod +x /usr/local/bin/composer
-  COMPOSER_ALLOW_SUPERUSER=1 composer --version
+  composer --version
 }
 
 panel_tar_url() {
@@ -513,7 +594,9 @@ panel_tar_url() {
 
 step_download() {
   mkdir -p "$PTERO_DIR"
-  dl "$(panel_tar_url)" /tmp/rizzx-panel.tar.gz
+  echo "Mengunduh: $(panel_tar_url)"
+  retry 3 dl "$(panel_tar_url)" /tmp/rizzx-panel.tar.gz
+  tar -tzf /tmp/rizzx-panel.tar.gz >/dev/null || { echo "Arsip rusak/tidak lengkap"; return 1; }
   tar -xzf /tmp/rizzx-panel.tar.gz -C "$PTERO_DIR"
   rm -f /tmp/rizzx-panel.tar.gz
   cd "$PTERO_DIR"
@@ -528,6 +611,7 @@ step_database() {
   existing="$("$mysql_bin" -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${DB_NAME}';")"
   if [[ "${existing:-0}" -gt 0 ]]; then
     echo "Database '${DB_NAME}' sudah berisi ${existing} tabel. Dibatalkan agar data lama tidak rusak."
+    echo "Jika itu sisa instalasi gagal:  sudo bash install-panel.sh uninstall"
     return 1
   fi
   "$mysql_bin" <<SQL
@@ -537,11 +621,12 @@ CREATE DATABASE IF NOT EXISTS ${DB_NAME};
 GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'127.0.0.1' WITH GRANT OPTION;
 FLUSH PRIVILEGES;
 SQL
+  echo "Database & user dibuat"
 }
 
 step_composer_install() {
   cd "$PTERO_DIR"
-  COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader --no-interaction
+  retry 2 composer install --no-dev --optimize-autoloader --no-interaction --prefer-dist -v
 }
 
 step_configure() {
@@ -639,6 +724,13 @@ EOF
 
 nginx_sub() { sed -e "s|__FQDN__|${FQDN}|g" -e "s|__ROOT__|${PTERO_DIR}|g" -e "s|__PHPSOCK__|${PHP_SOCK}|g"; }
 
+# nginx >= 1.25.1 memakai direktif "http2 on;" (listen ... http2 sudah deprecated)
+nginx_new_http2() {
+  local v; v="$(nginx -v 2>&1 | sed -n 's|.*nginx/\([0-9][0-9.]*\).*|\1|p')"
+  [[ -n "$v" ]] || return 1
+  [[ "$(printf '%s\n%s\n' "$v" "1.25.1" | sort -V | head -n1)" == "1.25.1" ]]
+}
+
 render_nginx_http() {
   { echo "server {"
     echo "    listen 80;"
@@ -651,6 +743,8 @@ render_nginx_http() {
 }
 
 render_nginx_ssl() {
+  local l4="listen 443 ssl http2;" l6="listen [::]:443 ssl http2;" h2=""
+  if nginx_new_http2; then l4="listen 443 ssl;"; l6="listen [::]:443 ssl;"; h2="    http2 on;"; fi
   { cat <<'EOF'
 server {
     listen 80;
@@ -667,8 +761,11 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+EOF
+    echo "    $l4"
+    echo "    $l6"
+    if [[ -n "$h2" ]]; then echo "$h2"; fi
+    cat <<'EOF'
     server_name __FQDN__;
 
     ssl_certificate /etc/letsencrypt/live/__FQDN__/fullchain.pem;
@@ -701,7 +798,7 @@ step_nginx() {
 
 step_ssl() {
   apt_run install certbot
-  certbot certonly --webroot -w "${PTERO_DIR}/public" -d "$FQDN" \
+  retry 2 certbot certonly --webroot -w "${PTERO_DIR}/public" -d "$FQDN" \
     --non-interactive --agree-tos --register-unsafely-without-email --no-eff-email \
     --keep-until-expiring --deploy-hook "systemctl reload nginx"
   [[ -f "/etc/letsencrypt/live/${FQDN}/fullchain.pem" ]] || { echo "sertifikat tidak terbentuk"; return 1; }
@@ -737,6 +834,7 @@ PHP
   out="$(php "$tmp")"; rm -f "$tmp"
   [[ "$out" =~ RIZZX_API_KEY_BEGIN:(ptla_[A-Za-z0-9_-]+):RIZZX_API_KEY_END ]] || { echo "format API key tidak dikenali"; return 1; }
   ( umask 077; printf '%s' "${BASH_REMATCH[1]}" >"$API_KEY_FILE" )
+  echo "API key dibuat"
 }
 
 step_finalize() {
@@ -759,7 +857,7 @@ step_finalize() {
 step_docker() {
   if command -v docker >/dev/null 2>&1; then echo "Docker sudah terpasang"
   else
-    dl https://get.docker.com /tmp/get-docker.sh
+    retry 3 dl https://get.docker.com /tmp/get-docker.sh
     CHANNEL=stable sh /tmp/get-docker.sh
     rm -f /tmp/get-docker.sh
   fi
@@ -772,7 +870,7 @@ step_wings_bin() {
   case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) echo "arsitektur tidak didukung"; return 1 ;; esac
   systemctl stop wings 2>/dev/null || true
   mkdir -p /etc/pterodactyl /var/lib/pterodactyl/volumes /var/log/pterodactyl /tmp/pterodactyl
-  dl "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_${arch}" /usr/local/bin/wings
+  retry 3 dl "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_${arch}" /usr/local/bin/wings
   chmod u+x /usr/local/bin/wings
   cat >/etc/systemd/system/wings.service <<'EOF'
 [Unit]
@@ -860,6 +958,7 @@ PHP
   rm -f "$cfg"
   ( umask 077; echo "$node_id" >"$NODE_STATE_FILE" )
   chown -R www-data:www-data "$PTERO_DIR"
+  echo "Node ID $node_id dibuat"
 }
 
 step_wings_configure() { # untuk Wings di VPS terpisah: pakai `wings configure`
@@ -944,7 +1043,7 @@ EOF
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PERINTAH
+#  PERINTAH: panel / wings / full
 # ══════════════════════════════════════════════════════════════════════════════
 panel_step_count() {
   local n=13
@@ -969,16 +1068,14 @@ run_panel_steps() {
   run_step "Service queue (pteroq) & cron"                   step_runtime
   run_step "Konfigurasi vhost Nginx"                         step_nginx
   if [[ $ENABLE_SSL == true ]]; then
-    if run_step -s "Menerbitkan SSL Let's Encrypt" step_ssl; then SSL_OK=1; fi
+    run_step -s "Menerbitkan SSL Let's Encrypt" step_ssl
+    if [[ $LAST_RC -eq 0 ]]; then SSL_OK=1; fi
   fi
-  if [[ $MAKE_API_KEY == true ]]; then run_step -s "Membuat Application API key" step_api_key || true; fi
+  if [[ $MAKE_API_KEY == true ]]; then run_step -s "Membuat Application API key" step_api_key; fi
   run_step "Finalisasi (APP_URL, cache, restart)"            step_finalize
   if [[ $SSL_OK == 1 ]]; then APP_URL="https://$FQDN"; else APP_URL="http://$FQDN"; fi
   if [[ $ENABLE_SSL == true && $SSL_OK != 1 ]]; then
     warn "SSL gagal diterbitkan; Panel berjalan via HTTP. Cek DNS lalu coba: certbot certonly --webroot -w ${PTERO_DIR}/public -d ${FQDN}"
-    if [[ $REQUIRE_SSL == true ]]; then
-      die "SSL wajib (--require-ssl) tetapi gagal terbit. Panel sudah terpasang via HTTP; perbaiki DNS/port 80 lalu terbitkan sertifikat manual."
-    fi
   fi
 }
 
@@ -1045,7 +1142,7 @@ cmd_wings() {
     do_cfg=1
   fi
   local do_ssl=0
-  if [[ -n "$NODE_FQDN" && ( $ENABLE_SSL == true ) ]]; then
+  if [[ -n "$NODE_FQDN" && $ENABLE_SSL == true ]]; then
     NODE_FQDN="${NODE_FQDN,,}"; [[ $NODE_FQDN =~ $HOST_RE ]] || die "FQDN node '$NODE_FQDN' tidak valid."
     if [[ -n "$(port_owner 80)" && "$(port_owner 80)" != "nginx" ]]; then warn "Port 80 terpakai, SSL node dilewati."
     else dns_matches "$NODE_FQDN" || true; do_ssl=1; fi
@@ -1058,9 +1155,13 @@ cmd_wings() {
   local t0=$SECONDS
   run_step "Memasang Docker"                        step_docker
   run_step "Memasang Wings & service systemd"       step_wings_bin
-  if [[ $do_ssl == 1 ]]; then run_step -s "Menerbitkan SSL untuk node ($NODE_FQDN)" step_node_ssl || true; fi
-  if [[ $do_cfg == 1 ]]; then run_step -s "Mengonfigurasi Wings dari Panel" step_wings_configure || warn "wings configure gagal; cek URL/token/ID node dan pastikan Panel bisa dijangkau."; fi
-  run_step -s "Menyalakan Wings"                    step_wings_start || warn "Wings belum bisa jalan; cek: journalctl -u wings -n 50"
+  if [[ $do_ssl == 1 ]]; then run_step -s "Menerbitkan SSL untuk node ($NODE_FQDN)" step_node_ssl; fi
+  if [[ $do_cfg == 1 ]]; then
+    run_step -s "Mengonfigurasi Wings dari Panel" step_wings_configure
+    if [[ $LAST_RC -ne 0 ]]; then warn "wings configure gagal; cek URL/token/ID node dan pastikan Panel bisa dijangkau."; fi
+  fi
+  run_step -s "Menyalakan Wings"                    step_wings_start
+  if [[ $LAST_RC -ne 0 ]]; then warn "Wings belum bisa jalan; cek: journalctl -u wings -n 50"; fi
   validate_wings
   echo
   printf '  %s%s┏━━ 🚀  WINGS TERPASANG  (%ss) ━━━━━━━━━━━━━━━━━━━━┓%s\n' "$BLD" "$GRN" "$((SECONDS - t0))" "$RST"
@@ -1090,9 +1191,11 @@ cmd_full() {
   run_panel_steps
   run_step "Memasang Docker"                        step_docker
   run_step "Memasang Wings & service systemd"       step_wings_bin
-  if [[ $node_ssl == 1 ]]; then run_step -s "Menerbitkan SSL untuk node ($NODE_FQDN)" step_node_ssl || true; fi
-  run_step -s "Membuat Location & Node otomatis"    step_node_create || warn "Node gagal dibuat otomatis; buat manual di Panel → Admin → Nodes lalu konfigurasi Wings."
-  run_step -s "Menyalakan Wings"                    step_wings_start || warn "Wings belum bisa jalan; cek: journalctl -u wings -n 50"
+  if [[ $node_ssl == 1 ]]; then run_step -s "Menerbitkan SSL untuk node ($NODE_FQDN)" step_node_ssl; fi
+  run_step -s "Membuat Location & Node otomatis"    step_node_create
+  if [[ $LAST_RC -ne 0 ]]; then warn "Node gagal dibuat otomatis; buat manual di Panel → Admin → Nodes lalu konfigurasi Wings."; fi
+  run_step -s "Menyalakan Wings"                    step_wings_start
+  if [[ $LAST_RC -ne 0 ]]; then warn "Wings belum bisa jalan; cek: journalctl -u wings -n 50"; fi
   validate_panel
   validate_wings
   write_creds
@@ -1108,6 +1211,9 @@ cmd_full() {
   [[ $chk_fail -eq 0 ]] || exit 1
 }
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  PERINTAH: status / doctor / logs
+# ══════════════════════════════════════════════════════════════════════════════
 svc_dot() { if systemctl is-active --quiet "$1" 2>/dev/null; then printf '%s●%s aktif' "$GRN" "$RST"; else printf '%s●%s mati/tidak ada' "$RED" "$RST"; fi; }
 
 cmd_status() {
@@ -1126,7 +1232,7 @@ cmd_status() {
     ver="$(cd "$PTERO_DIR" && php artisan p:info 2>/dev/null | grep -iE 'panel version' | head -n1 | sed 's/^[[:space:]]*//' || true)"
     printf '  %-18s %s\n' "Terpasang" "ya ($PTERO_DIR)"
     printf '  %-18s %s\n' "URL" "$url"
-    [[ -n "$ver" ]] && printf '  %-18s %s\n' "Versi" "$ver"
+    if [[ -n "$ver" ]]; then printf '  %-18s %s\n' "Versi" "$ver"; fi
     local f; f="$(awk -F'[/:]+' '{print $2}' <<<"$url")"
     if [[ -f "/etc/letsencrypt/live/$f/fullchain.pem" ]]; then
       printf '  %-18s %s\n' "SSL berakhir" "$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$f/fullchain.pem" | cut -d= -f2)"
@@ -1134,7 +1240,7 @@ cmd_status() {
   else printf '  %-18s %s\n' "Terpasang" "belum"; fi
   local s; for s in nginx mariadb redis-server pteroq; do printf '  %-18s %s\n' "$s" "$(svc_dot "$s")"; done
   local fpm; fpm="$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^php[0-9.]+-fpm\.service$' | head -n1 || true)"
-  [[ -n "$fpm" ]] && printf '  %-18s %s\n' "${fpm%.service}" "$(svc_dot "$fpm")"
+  if [[ -n "$fpm" ]]; then printf '  %-18s %s\n' "${fpm%.service}" "$(svc_dot "$fpm")"; fi
   head1 "Wings"
   if wings_installed; then
     printf '  %-18s %s\n' "Terpasang" "ya"
@@ -1147,16 +1253,94 @@ cmd_status() {
   echo
 }
 
+cmd_logs() {
+  [[ -f "$LOG_FILE" ]] || die "Belum ada log di $LOG_FILE"
+  info "Mengikuti $LOG_FILE (Ctrl+C untuk berhenti)"
+  tail -n 60 -f "$LOG_FILE"
+}
+
+step_doctor_fix() {
+  local fpm; fpm="$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^php[0-9.]+-fpm\.service$' | head -n1 || true)"
+  dpkg --configure -a || true
+  chown -R www-data:www-data "$PTERO_DIR"
+  chmod -R 755 "$PTERO_DIR/storage" "$PTERO_DIR/bootstrap/cache"
+  cd "$PTERO_DIR"
+  php artisan optimize:clear || true
+  php artisan queue:restart || true
+  local s; for s in mariadb redis-server ${fpm:+"$fpm"} nginx pteroq.service; do
+    echo "restart $s"; systemctl restart "$s" || echo "GAGAL restart $s"
+  done
+  if wings_installed && [[ -s /etc/pterodactyl/config.yml ]]; then systemctl restart wings || true; fi
+}
+
+cmd_doctor() {
+  init_log
+  head1 "Diagnosa RIZZX"
+  local ram disk load swap
+  ram="$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)"
+  disk="$(df -Pm / | awk 'NR==2 {print $4}')"
+  swap="$(awk '/SwapTotal/ {print int($2/1024)}' /proc/meminfo)"
+  load="$(cut -d' ' -f1-3 /proc/loadavg)"
+  info "RAM tersedia ${ram} MB • swap ${swap} MB • disk kosong ${disk} MB • load ${load}"
+  if (( ram < 300 )); then warn "RAM hampir habis; proses bisa di-kill OOM. Cek: dmesg | grep -i 'out of memory'"; fi
+  if (( disk < 1000 )); then warn "Disk hampir penuh."; fi
+  if pgrep -x "$APT_PROCS" >/dev/null 2>&1; then
+    warn "apt/dpkg sedang berjalan: $(pgrep -l -x "$APT_PROCS" | awk '{print $2}' | sort -u | paste -sd, -)  (ini penyebab umum instalasi 'diam')"
+  else ok "Tidak ada lock apt/dpkg"; fi
+  if dmesg 2>/dev/null | grep -qi 'out of memory'; then warn "Ada catatan OOM di dmesg (proses pernah di-kill kehabisan RAM)."; fi
+
+  head1 "Service"
+  local s; for s in nginx mariadb redis-server pteroq docker wings; do printf '  %-14s %s\n' "$s" "$(svc_dot "$s")"; done
+  local fpm; fpm="$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^php[0-9.]+-fpm\.service$' | head -n1 || true)"
+  if [[ -n "$fpm" ]]; then printf '  %-14s %s\n' "${fpm%.service}" "$(svc_dot "$fpm")"; fi
+
+  if panel_installed; then
+    local url; url="$(grep -E '^APP_URL=' "$PTERO_DIR/.env" | cut -d= -f2- | tr -d '"')"
+    FQDN="$(awk -F'[/:]+' '{print $2}' <<<"$url")"
+    if [[ "$url" == https://* ]]; then SSL_OK=1; else SSL_OK=0; fi
+    head1 "Panel ($url)"
+    chk "php artisan p:info (DB & Redis)" bash -c "cd '$PTERO_DIR' && php artisan p:info"
+    chk "nginx -t (konfigurasi valid)"    nginx -t
+    chk "Panel menjawab HTTP"             http_ok
+    head1 "Log terbaru"
+    local lv; lv="$(ls -t "$PTERO_DIR"/storage/logs/laravel-*.log 2>/dev/null | head -n1 || true)"
+    if [[ -n "$lv" ]]; then info "Laravel: $lv"; tail -n 12 "$lv" | cut -c1-200 | sed 's/^/    /'; fi
+    if [[ -s /var/log/nginx/pterodactyl.app-error.log ]]; then info "Nginx error:"; tail -n 8 /var/log/nginx/pterodactyl.app-error.log | sed 's/^/    /'; fi
+    info "pteroq:"; journalctl -u pteroq -n 5 --no-pager 2>/dev/null | sed 's/^/    /' || true
+  else
+    warn "Panel belum terpasang/utuh di $PTERO_DIR."
+    if [[ -d "$PTERO_DIR" && -n "$(ls -A "$PTERO_DIR" 2>/dev/null)" ]]; then
+      warn "Ada sisa instalasi gagal. Bersihkan:  sudo bash install-panel.sh uninstall"
+    fi
+    if [[ -f "$LOG_FILE" ]]; then head1 "30 baris terakhir log instalasi"; tail -n 30 "$LOG_FILE" | cut -c1-200 | sed 's/^/    /'; fi
+    echo; return 0
+  fi
+  echo
+  if confirm "Jalankan perbaikan otomatis (permission, cache, restart service)?" y; then
+    STEP_TOTAL=1
+    run_step "Perbaikan otomatis" step_doctor_fix
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PERINTAH: admin / update / uninstall
+# ══════════════════════════════════════════════════════════════════════════════
+step_admin_extra() {
+  cd "$PTERO_DIR"
+  php artisan p:user:make --email="$ADMIN_EMAIL" --username="$ADMIN_USER" \
+    --name-first="$ADMIN_FIRST" --name-last="$ADMIN_LAST" --password="$ADMIN_PASSWORD" --admin=1
+  chown -R www-data:www-data "$PTERO_DIR/storage" 2>/dev/null || true
+}
+
 cmd_admin() {
   panel_installed || die "Panel belum terpasang di $PTERO_DIR."
   init_log
   head1 "Tambah admin Panel"
-  local email user first last pw gen=0
+  local email user pw gen=0
   prompt email "Email" "${ADMIN_EMAIL:-}"
   [[ $email =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die "Email tidak valid / kosong (pakai --email)."
   prompt user "Username" "admin2"
   [[ $user =~ ^[A-Za-z0-9._-]{1,191}$ ]] || die "Username tidak valid."
-  first="Admin"; last="Rizzx"
   pw="$ADMIN_PASSWORD"
   if [[ -z "$pw" && $HAVE_TTY == 1 ]]; then prompt pw "Password (kosong = acak)" "" secret; fi
   if [[ -z "$pw" ]]; then pw="$(rand_str 20)"; gen=1; fi
@@ -1165,18 +1349,13 @@ cmd_admin() {
   ADMIN_EMAIL="$email"; ADMIN_USER="$user"; ADMIN_PASSWORD="$pw"
   run_step "Membuat admin '$user'" step_admin_extra
   summary_box "$(printf '%-10s %s' 'Username' "$user")" "$(printf '%-10s %s' 'Email' "$email")" "$(printf '%-10s %s' 'Password' "$pw")"
-  [[ $gen == 1 ]] && warn "Simpan password ini, tidak ditampilkan lagi."
+  if [[ $gen == 1 ]]; then warn "Simpan password ini, tidak ditampilkan lagi."; fi
   return 0
-}
-step_admin_extra() {
-  cd "$PTERO_DIR"
-  php artisan p:user:make --email="$ADMIN_EMAIL" --username="$ADMIN_USER" \
-    --name-first="$ADMIN_FIRST" --name-last="$ADMIN_LAST" --password="$ADMIN_PASSWORD" --admin=1
-  chown -R www-data:www-data "$PTERO_DIR/storage" 2>/dev/null || true
 }
 
 step_backup() {
-  local dir="/root/rizzx-backup-$(date +%Y%m%d-%H%M%S)" dumper db
+  local dir dumper db
+  dir="/root/rizzx-backup-$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$dir"; chmod 700 "$dir"
   cp -a "$PTERO_DIR/.env" "$dir/panel.env"
   db="$(grep -E '^DB_DATABASE=' "$PTERO_DIR/.env" | cut -d= -f2- | tr -d '"')"
@@ -1190,11 +1369,12 @@ step_update_panel() {
   cd "$PTERO_DIR"
   trap 'cd "$PTERO_DIR" && php artisan up >/dev/null 2>&1 || true' EXIT
   php artisan down
-  dl "$(panel_tar_url)" /tmp/rizzx-panel.tar.gz
+  retry 3 dl "$(panel_tar_url)" /tmp/rizzx-panel.tar.gz
+  tar -tzf /tmp/rizzx-panel.tar.gz >/dev/null
   tar -xzf /tmp/rizzx-panel.tar.gz -C "$PTERO_DIR"
   rm -f /tmp/rizzx-panel.tar.gz
   chmod -R 755 storage/* bootstrap/cache
-  COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader --no-interaction
+  composer install --no-dev --optimize-autoloader --no-interaction --prefer-dist -v
   php artisan view:clear
   php artisan config:clear
   php artisan migrate --seed --force
@@ -1215,12 +1395,51 @@ cmd_update() {
   STEP_TOTAL=2
   run_step "Backup .env & database"        step_backup
   run_step "Update Panel (maintenance mode otomatis)" step_update_panel
-  [[ -f /tmp/.rizzx-backup-dir ]] && info "Backup tersimpan di: $(cat /tmp/.rizzx-backup-dir)"
+  if [[ -f /tmp/.rizzx-backup-dir ]]; then info "Backup tersimpan di: $(cat /tmp/.rizzx-backup-dir)"; fi
   rm -f /tmp/.rizzx-backup-dir
   ok "Update selesai."
   echo
 }
 
+step_uninstall() {
+  [[ -n "$PTERO_DIR" && "$PTERO_DIR" == "/var/www/pterodactyl" ]] || { echo "PTERO_DIR tidak aman"; return 1; }
+  systemctl disable --now pteroq.service 2>/dev/null || true
+  rm -f /etc/systemd/system/pteroq.service
+  systemctl daemon-reload
+  rm -f /etc/nginx/sites-enabled/pterodactyl.conf /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-available/pterodactyl.conf.http.bak
+  if command -v nginx >/dev/null 2>&1 && nginx -t 2>/dev/null; then systemctl reload nginx 2>/dev/null || true; fi
+  if id www-data >/dev/null 2>&1; then
+    { crontab -u www-data -l 2>/dev/null | grep -v 'artisan schedule:run' || true; } | crontab -u www-data - 2>/dev/null || true
+  fi
+  local m; m="$(mysql_cli || true)"
+  if [[ -n "$m" ]]; then
+    "$m" -e "DROP DATABASE IF EXISTS \`${DB_NAME}\`; DROP USER IF EXISTS '${DB_USER}'@'127.0.0.1'; FLUSH PRIVILEGES;" || true
+  fi
+  rm -rf "$PTERO_DIR"
+  rm -f "$CRED_FILE"
+  echo "Panel dibersihkan. Paket (nginx/php/mariadb/redis) dibiarkan terpasang; Wings tidak disentuh."
+}
+
+cmd_uninstall() {
+  init_log
+  head1 "Uninstall Panel"
+  warn "Ini MENGHAPUS: ${PTERO_DIR}, database '${DB_NAME}', user DB '${DB_USER}', service pteroq, vhost nginx, cron."
+  warn "Semua data Panel (user, server, node) hilang permanen. Wings/Docker tidak dihapus."
+  if [[ $ASSUME_YES == true ]]; then
+    [[ $FORCE == true ]] || die "Mode non-interaktif butuh --yes --force."
+  else
+    [[ $HAVE_TTY == 1 ]] || die "Butuh terminal interaktif atau --yes --force."
+    local ans; prompt ans "Ketik HAPUS (huruf besar) untuk melanjutkan" ""
+    [[ "$ans" == "HAPUS" ]] || { ERR_SHOWN=1; warn "Dibatalkan."; exit 0; }
+  fi
+  STEP_TOTAL=1
+  run_step "Membersihkan Panel" step_uninstall
+  ok "Selesai. Sekarang kamu bisa menjalankan ulang:  sudo bash install-panel.sh panel"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MENU & MAIN
+# ══════════════════════════════════════════════════════════════════════════════
 menu() {
   banner
   local pst wst
@@ -1233,32 +1452,40 @@ menu() {
   printf '   %s4%s  📊  Status server\n'                           "$CYN" "$RST"
   printf '   %s5%s  👤  Tambah admin Panel\n'                      "$CYN" "$RST"
   printf '   %s6%s  ⬆️   Update Panel\n'                           "$CYN" "$RST"
+  printf '   %s7%s  🩺  Doctor (diagnosa & perbaiki)\n'            "$CYN" "$RST"
+  printf '   %s8%s  📜  Lihat log live\n'                          "$CYN" "$RST"
+  printf '   %s9%s  🧹  Uninstall / bersihkan sisa gagal\n'        "$CYN" "$RST"
   printf '   %s0%s  ✖   Keluar\n\n'                               "$CYN" "$RST"
   local c; prompt c "Pilih menu" "1"
   case "$c" in
     1) CMD=panel ;; 2) CMD=wings ;; 3) CMD=full ;; 4) CMD=status ;; 5) CMD=admin ;; 6) CMD=update ;;
+    7) CMD=doctor ;; 8) CMD=logs ;; 9) CMD=uninstall ;;
     0|q|Q) ERR_SHOWN=1; exit 0 ;;
     *) die "Pilihan '$c' tidak valid." ;;
   esac
   echo
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════════════════════════
-need_root
-if [[ -z "$CMD" || "$CMD" == "menu" ]]; then
-  if [[ $HAVE_TTY == 1 ]]; then menu
-  else banner; usage; die "Tanpa terminal interaktif, sebutkan perintah: panel | wings | full | status | admin | update"; fi
-else
-  banner
-fi
+main() {
+  need_root
+  if [[ -z "$CMD" || "$CMD" == "menu" ]]; then
+    if [[ $HAVE_TTY == 1 ]]; then menu
+    else banner; usage; die "Tanpa terminal interaktif, sebutkan perintah: panel | wings | full | status | doctor | admin | update | uninstall | logs"; fi
+  else
+    banner
+  fi
+  case "$CMD" in
+    panel)     cmd_panel ;;
+    wings)     cmd_wings ;;
+    full)      cmd_full ;;
+    status)    cmd_status ;;
+    doctor)    cmd_doctor ;;
+    admin)     cmd_admin ;;
+    update)    cmd_update ;;
+    uninstall) cmd_uninstall ;;
+    logs)      cmd_logs ;;
+  esac
+}
 
-case "$CMD" in
-  panel)  cmd_panel ;;
-  wings)  cmd_wings ;;
-  full)   cmd_full ;;
-  status) cmd_status ;;
-  admin)  cmd_admin ;;
-  update) cmd_update ;;
-esac
+if [[ "${RIZZX_SOURCE_ONLY:-0}" == 1 ]]; then return 0 2>/dev/null || exit 0; fi
+main
