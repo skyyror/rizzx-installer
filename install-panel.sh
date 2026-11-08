@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════════════════════════════
-#  RIZZX • Pterodactyl All-in-One Installer  v3.0  (LIVE LOG edition)
+#  RIZZX • Pterodactyl All-in-One Installer  v3.1  (LIVE LOG • NET-CHECK FIX)
 #
 #  Menu interaktif : sudo bash install-panel.sh
 #  Panel           : sudo bash install-panel.sh panel  --fqdn panel.domain.com --ssl
@@ -8,18 +8,20 @@
 #  Panel+Wings+Node: sudo bash install-panel.sh full   --fqdn panel.domain.com --ssl --yes
 #  Lainnya         : status | doctor | admin | update | uninstall | logs | --help
 #
-#  Perubahan utama v3.0:
-#   - Log SELALU tampil live (+ disimpan ke file). Mode senyap: --quiet
-#   - Heartbeat tiap 20 dtk: lama berjalan, proses aktif, baris log terakhir
-#   - Penanganan lock apt/dpkg (unattended-upgrades), apt timeout + IPv4
-#   - Retry otomatis untuk langkah yang butuh jaringan
-#   - Perintah baru: doctor (diagnosa + perbaikan), uninstall (bersihkan sisa
-#     instalasi gagal), logs (ikuti log)
-#   - Kompatibel dengan bot V8 (admin "admin" ID 1, pteroq, cron, env bot)
+#  Perubahan v3.1 (perbaikan "Tidak bisa menjangkau github.com"):
+#   - Cek koneksi GitHub tidak lagi sekali-coba: 4x percobaan (IPv4 lalu default),
+#     tanpa curl -f (respons HTTP apa pun = terhubung), error curl asli DITAMPILKAN
+#     + diagnosa (DNS / firewall / timeout / TLS). Bisa dilewati: --skip-net-check
+#   - Peringatan "packagekitd" yang menyesatkan dihapus: yang dicek sekarang lock
+#     apt/dpkg yang benar-benar dipegang proses lain (fuser / pgrep)
+#   - Kepemilikan file Panel diperbaiki lagi setelah validasi (php artisan sebagai
+#     root bisa membuat log milik root => Panel error 500)
+#   - Heredoc kredensial dirapikan (tanda kutip ganda tidak ikut tercetak)
+#  Kompatibel dengan bot V8 (admin "admin" ID 1, pteroq, cron, env bot).
 # ══════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
-VERSION="3.0.0"
+VERSION="3.1.0"
 LOG_FILE="/var/log/rizzx-panel-install.log"
 PTERO_DIR="/var/www/pterodactyl"
 CRED_FILE="/root/rizzx-panel-credentials.txt"
@@ -46,6 +48,7 @@ FORCE_OS="${FORCE_OS:-false}"
 FORCE="${FORCE:-false}"
 FORCE_SSL="${FORCE_SSL:-false}"      # bot V8: jangan batalkan SSL walau cek DNS/IP tidak cocok
 REQUIRE_SSL="${REQUIRE_SSL:-false}"  # bot V8: SSL gagal terbit => script exit != 0 (bukan diam-diam HTTP)
+SKIP_NET_CHECK="${SKIP_NET_CHECK:-false}"
 QUIET="${QUIET:-false}"
 NODE_FQDN="${NODE_FQDN:-}"
 NODE_NAME="${NODE_NAME:-Node-RIZZX}"
@@ -74,6 +77,7 @@ SPIN=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 ERR_SHOWN=0; STEP_NUM=0; STEP_TOTAL=0; SSL_OK=0; CHILD_PID=""; HB_PID=""; LAST_RC=0
 RAM_MB=0; DISK_MB=0; VIRT=""; OS_ID=""; OS_VER=""; OS_CODENAME=""; PUBLIC_IP=""
 HAVE_TTY=0; GEN_PW=0; IS_IP=0; APP_URL=""; DB_PASS=""; PHP_SOCK=""
+NET_ERR=""; NET_RC=0
 
 banner() {
   local -a lines=(
@@ -151,6 +155,7 @@ Opsi umum:
   --force-ssl           Tetap lanjut SSL walau DNS/IP tidak cocok (dipakai bot)
   --require-ssl         SSL wajib: gagal terbit => script exit != 0 (dipakai bot)
   --force-os            Lewati cek OS (risiko ditanggung sendiri)
+  --skip-net-check      Lewati cek koneksi GitHub di pre-flight
 
 Opsi node (full / wings):
   --node-fqdn <domain>  FQDN node (default = FQDN Panel)
@@ -162,8 +167,8 @@ Opsi node (full / wings):
   --token <ptla_...>    [wings] Application API key Panel
 
 Env bot V8 diterima: FQDN, ADMIN_EMAIL, ADMIN_PASSWORD, TIMEZONE, ENABLE_SSL,
-FORCE_SSL, REQUIRE_SSL, NO_COLOR, TERM (+ user_email, user_password, timezone,
-CONFIGURE_LETSENCRYPT).   Log: ${LOG_FILE}
+FORCE_SSL, REQUIRE_SSL, SKIP_NET_CHECK, NO_COLOR, TERM (+ user_email,
+user_password, timezone, CONFIGURE_LETSENCRYPT).   Log: ${LOG_FILE}
 EOF
 }
 
@@ -191,6 +196,7 @@ while [[ $# -gt 0 ]]; do
     --force-ssl)     FORCE_SSL="true"; shift ;;
     --require-ssl)   REQUIRE_SSL="true"; shift ;;
     --force-os)      FORCE_OS="true"; shift ;;
+    --skip-net-check) SKIP_NET_CHECK="true"; shift ;;
     --node-fqdn)     optval "$@"; NODE_FQDN="$2"; shift 2 ;;
     --node-name)     optval "$@"; NODE_NAME="$2"; shift 2 ;;
     --node-ram)      optval "$@"; NODE_RAM="$2"; shift 2 ;;
@@ -212,7 +218,7 @@ to_bool() {
   esac
 }
 ENABLE_SSL="$(to_bool "$ENABLE_SSL")"
-for _v in MAKE_API_KEY ASSUME_YES FORCE_OS FORCE QUIET FORCE_SSL REQUIRE_SSL; do
+for _v in MAKE_API_KEY ASSUME_YES FORCE_OS FORCE QUIET FORCE_SSL REQUIRE_SSL SKIP_NET_CHECK; do
   _b="$(to_bool "${!_v}")"; if [[ $_b == ask ]]; then _b=false; fi
   printf -v "$_v" '%s' "$_b"
 done
@@ -252,7 +258,7 @@ retry() { # retry N perintah...
   local n="$1" i=1; shift
   until "$@"; do
     if (( i >= n )); then echo "Gagal setelah $n percobaan: $*"; return 1; fi
-    echo "Percobaan $i/$n gagal, ulangi dalam 5 detik: $*"; i=$((i + 1)); sleep 5
+    echo "Percobaan $i/$n gagal, ulangi dalam 5 detik: $*"; i=$((i + 1)); sleep "${RETRY_DELAY:-5}"
   done
 }
 
@@ -355,13 +361,23 @@ APT=(apt-get -y -q
   -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30
   -o Acquire::ForceIPv4=true -o APT::Color=0)
 
-APT_PROCS='apt|apt-get|dpkg|aptitude|unattended-upgr|packagekitd'
+# packagekitd SENGAJA tidak dihitung: ia tidak memegang lock dpkg dan sering
+# hanya idle di VPS baru (v3.0 salah menganggapnya "apt sibuk").
+APT_PROCS='apt|apt-get|dpkg|aptitude|unattended-upgr'
+apt_holders() { (pgrep -l -x "$APT_PROCS" 2>/dev/null || true) | awk '{print $2}' | sort -u | paste -sd, -; }
+apt_busy() { # 0 = ada proses yang benar-benar memegang lock apt/dpkg
+  if command -v fuser >/dev/null 2>&1; then
+    fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1
+  else
+    pgrep -x "$APT_PROCS" >/dev/null 2>&1
+  fi
+}
 wait_apt() {
   local i=0 holders
-  while pgrep -x "$APT_PROCS" >/dev/null 2>&1; do
+  while apt_busy; do
     if [[ $i -eq 0 ]]; then
-      holders="$(pgrep -l -x "$APT_PROCS" | awk '{print $2}' | sort -u | paste -sd, -)"
-      echo "apt/dpkg sedang dipakai proses lain ($holders). Menghentikan unattended-upgrades/packagekit..."
+      holders="$(apt_holders)"
+      echo "apt/dpkg sedang dipakai proses lain (${holders:-tidak diketahui}). Menghentikan unattended-upgrades/packagekit..."
       timeout 60 systemctl stop unattended-upgrades 2>/dev/null || true
       timeout 20 systemctl stop packagekit 2>/dev/null || true
     fi
@@ -383,6 +399,45 @@ mysql_cli() { command -v mariadb || command -v mysql; }
 port_owner() {
   command -v ss >/dev/null 2>&1 || return 0
   ss -H -tlnp "sport = :$1" 2>/dev/null | grep -o '"[^"]*"' | head -n1 | tr -d '"' || true
+}
+
+# ── Cek koneksi GitHub (v3.1) ────────────────────────────────────────────────
+# Tanpa -f: respons HTTP apa pun (200/301/403/429) = koneksi OK. Yang dianggap
+# gagal hanya kegagalan jaringan sungguhan (DNS, timeout, ditolak, TLS).
+net_probe() { # net_probe URL [opsi curl...]  → isi NET_RC / NET_ERR
+  local url="$1" rc=0; shift
+  NET_ERR="$(curl -sS -o /dev/null --connect-timeout 10 --max-time 20 "$@" "$url" 2>&1)" || rc=$?
+  NET_RC=$rc
+  return "$rc"
+}
+net_hint() { # penjelasan singkat dari kode exit curl
+  case "$1" in
+    6)  echo "DNS gagal me-resolve domain (cek /etc/resolv.conf, coba: echo 'nameserver 1.1.1.1' > /etc/resolv.conf)" ;;
+    7)  echo "Koneksi ditolak/diblokir (cek firewall: ufw status, iptables -L OUTPUT, security group provider)" ;;
+    28) echo "Timeout (jaringan VPS lambat/diblokir; cek apakah IPv6 bermasalah: curl -4 -I https://github.com)" ;;
+    35|51|58|60|77|83) echo "Masalah TLS/sertifikat (cek jam server: timedatectl; pasang ulang: apt install --reinstall ca-certificates)" ;;
+    *)  echo "Kegagalan jaringan umum (kode curl $1)" ;;
+  esac
+}
+net_check() {
+  if [[ $SKIP_NET_CHECK == true ]]; then warn "Cek koneksi GitHub dilewati (--skip-net-check)."; return 0; fi
+  local attempt mode
+  local -a modes=("-4" "")
+  for attempt in 1 2 3 4; do
+    for mode in "${modes[@]}"; do
+      if net_probe https://github.com ${mode:+"$mode"}; then
+        logf "net_check OK (percobaan $attempt, mode '${mode:-default}')"
+        return 0
+      fi
+      logf "net_check gagal (percobaan $attempt, mode '${mode:-default}'): curl exit $NET_RC: $NET_ERR"
+    done
+    if (( attempt < 4 )); then sleep $(( attempt * 3 )); fi
+  done
+  bad "Tidak bisa menjangkau github.com setelah 4x percobaan."
+  info "Error curl (kode $NET_RC): ${NET_ERR:-tidak ada pesan}"
+  info "$(net_hint "$NET_RC")"
+  info "Jika kamu yakin koneksi normal, lewati cek ini dengan:  --skip-net-check"
+  die "Pre-flight dihentikan: GitHub tidak terjangkau dari VPS ini."
 }
 
 preflight_common() { # $1 = mode: panel | wings
@@ -420,24 +475,27 @@ preflight_common() { # $1 = mode: panel | wings
   elif (( DISK_MB < 5120 )); then warn "Disk kosong ${DISK_MB} MB (disarankan > 5 GB)."
   else ok "Disk kosong: ${DISK_MB} MB"; fi
 
-  # lock apt yang sedang dipegang proses lain (penyebab umum "diam saja")
-  if pgrep -x "$APT_PROCS" >/dev/null 2>&1; then
-    warn "Ada proses apt/dpkg lain berjalan: $(pgrep -l -x "$APT_PROCS" | awk '{print $2}' | sort -u | paste -sd, -). Akan dihentikan/ditunggu otomatis."
+  # lock apt/dpkg yang benar-benar dipegang proses lain (penyebab umum "diam saja")
+  if apt_busy; then
+    local held; held="$(apt_holders)"
+    warn "apt/dpkg sedang dipakai proses lain (${held:-tidak diketahui}). Akan ditunggu/dihentikan otomatis."
   else ok "Tidak ada lock apt/dpkg"; fi
 
   if ! command -v curl >/dev/null 2>&1; then
     info "Memasang curl dulu..."
-    { apt-get update -q -o Acquire::ForceIPv4=true && apt_run install curl ca-certificates; } 2>&1 | tee -a "$LOG_FILE" | sed -u 's/^/    │ /' || true
+    { wait_apt; apt-get update -q -o Acquire::ForceIPv4=true && apt_run install curl ca-certificates; } 2>&1 | tee -a "$LOG_FILE" | sed -u 's/^/    │ /' || true
     command -v curl >/dev/null 2>&1 || die "Gagal memasang curl."
   fi
-  getent hosts github.com >/dev/null 2>&1 || die "DNS gagal me-resolve github.com (cek /etc/resolv.conf / jaringan VPS)."
-  curl -fsSI --max-time 15 https://github.com >/dev/null 2>&1 || die "Tidak bisa menjangkau github.com (cek internet/firewall VPS)."
-  ok "Koneksi internet / GitHub OK"
-  PUBLIC_IP="$(curl -fsS4 --max-time 6 https://api.ipify.org 2>/dev/null || curl -fsS4 --max-time 6 https://ifconfig.me 2>/dev/null || true)"
-  if [[ -n "$PUBLIC_IP" ]]; then ok "IP publik: $PUBLIC_IP"; fi
   if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo yes)" == "no" ]]; then
     warn "Jam sistem belum sinkron NTP; ini bisa menggagalkan apt/SSL. Jalankan: timedatectl set-ntp true"
   fi
+  if [[ $SKIP_NET_CHECK != true ]]; then
+    getent hosts github.com >/dev/null 2>&1 || die "DNS gagal me-resolve github.com (cek /etc/resolv.conf / jaringan VPS)."
+  fi
+  net_check
+  if [[ $SKIP_NET_CHECK != true ]]; then ok "Koneksi internet / GitHub OK"; fi
+  PUBLIC_IP="$(curl -fsS4 --max-time 6 https://api.ipify.org 2>/dev/null || curl -fsS4 --max-time 6 https://ifconfig.me 2>/dev/null || true)"
+  if [[ -n "$PUBLIC_IP" ]]; then ok "IP publik: $PUBLIC_IP"; fi
 }
 
 preflight_panel() {
@@ -1060,6 +1118,9 @@ validate_panel() {
   chk "Service mariadb aktif"                    systemctl is-active --quiet mariadb
   chk "Service redis aktif"                      systemctl is-active --quiet redis-server
   chk "Service pteroq aktif"                     systemctl is-active --quiet pteroq.service
+  # php artisan di atas jalan sebagai root: kembalikan kepemilikan supaya
+  # www-data tetap bisa menulis log/cache (kalau tidak => Panel error 500).
+  chown -R www-data:www-data "$PTERO_DIR" 2>/dev/null || true
   chk "Panel menjawab HTTP (/auth/login)"        http_ok
 }
 validate_wings() {
@@ -1080,6 +1141,7 @@ write_creds() {
   if [[ -s "$NODE_STATE_FILE" ]]; then node="$(cat "$NODE_STATE_FILE")"; fi
   local node_txt="(tidak dibuat)"
   if [[ -n "$node" ]]; then node_txt="ID ${node} @ ${NODE_FQDN}"; fi
+  if [[ -z "$api" ]]; then api="(tidak dibuat; pakai --api-key bila perlu)"; fi
   ( umask 077
     cat >"$CRED_FILE" <<EOF
 RIZZX Pterodactyl - $(date '+%Y-%m-%d %H:%M:%S')
@@ -1090,7 +1152,7 @@ Admin password : ${ADMIN_PASSWORD}
 DB name / user : ${DB_NAME} / ${DB_USER}
 DB password    : ${DB_PASS}
 Panel path     : ${PTERO_DIR}
-App API key    : ${api:-"(tidak dibuat; pakai --api-key bila perlu)"}
+App API key    : ${api}
 Node           : ${node_txt}
 EOF
   )
@@ -1343,6 +1405,7 @@ step_doctor_fix() {
     echo "restart $s"; systemctl restart "$s" || echo "GAGAL restart $s"
   done
   if wings_installed && [[ -s /etc/pterodactyl/config.yml ]]; then systemctl restart wings || true; fi
+  chown -R www-data:www-data "$PTERO_DIR"
 }
 
 cmd_doctor() {
@@ -1356,10 +1419,14 @@ cmd_doctor() {
   info "RAM tersedia ${ram} MB • swap ${swap} MB • disk kosong ${disk} MB • load ${load}"
   if (( ram < 300 )); then warn "RAM hampir habis; proses bisa di-kill OOM. Cek: dmesg | grep -i 'out of memory'"; fi
   if (( disk < 1000 )); then warn "Disk hampir penuh."; fi
-  if pgrep -x "$APT_PROCS" >/dev/null 2>&1; then
-    warn "apt/dpkg sedang berjalan: $(pgrep -l -x "$APT_PROCS" | awk '{print $2}' | sort -u | paste -sd, -)  (ini penyebab umum instalasi 'diam')"
+  if apt_busy; then
+    warn "apt/dpkg sedang berjalan: $(apt_holders)  (ini penyebab umum instalasi 'diam')"
   else ok "Tidak ada lock apt/dpkg"; fi
   if dmesg 2>/dev/null | grep -qi 'out of memory'; then warn "Ada catatan OOM di dmesg (proses pernah di-kill kehabisan RAM)."; fi
+
+  head1 "Koneksi"
+  if net_probe https://github.com -4; then ok "github.com terjangkau (IPv4)"
+  else bad "github.com tidak terjangkau via IPv4 (curl $NET_RC): ${NET_ERR:-?}"; info "$(net_hint "$NET_RC")"; fi
 
   head1 "Service"
   local s; for s in nginx mariadb redis-server pteroq docker wings; do printf '  %-14s %s\n' "$s" "$(svc_dot "$s")"; done
